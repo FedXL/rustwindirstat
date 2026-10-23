@@ -1,4 +1,5 @@
 mod model;
+mod parallel;
 mod scanner;
 mod treemap;
 
@@ -62,6 +63,7 @@ struct DiskApp {
     render_size: [usize; 2],
     render_requested_size: [usize; 2],
     render_finished_size: [usize; 2],
+    render_elapsed: Option<Duration>,
     render_requested_at: std::time::Instant,
     map_texture: Option<egui::TextureHandle>,
     map_hits: Vec<u32>,
@@ -144,7 +146,7 @@ impl DiskApp {
             render_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             render_rx: Some(render_rx), render_tx, render_size: [0, 0], render_requested_size: [0, 0],
             render_running: Arc::new(AtomicBool::new(false)), render_progress: None, render_finished_size: [0,0],
-            render_requested_at: std::time::Instant::now(), map_texture: None, map_hits: Vec::new(), map_rects: Vec::new(),
+            render_elapsed: None, render_requested_at: std::time::Instant::now(), map_texture: None, map_hits: Vec::new(), map_rects: Vec::new(),
         }
     }
 
@@ -175,6 +177,7 @@ impl DiskApp {
         self.render_size = [0, 0];
         self.render_requested_size = [0, 0];
         self.render_finished_size = [0, 0];
+        self.render_elapsed = None;
         self.map_texture = None;
         self.map_hits.clear();
         self.map_rects.clear();
@@ -185,6 +188,7 @@ impl DiskApp {
         if let Some(rx) = &self.render_rx {
             while let Ok((generation, requested_size, map)) = rx.try_recv() {
                 if generation == self.render_generation.load(Ordering::Relaxed) {
+                    let elapsed = map.elapsed;
                     let actual_size = map.image.size;
                     if let Some(texture) = &mut self.map_texture {
                         texture.set(map.image, egui::TextureOptions::LINEAR);
@@ -197,6 +201,7 @@ impl DiskApp {
                     }
                     self.render_size = actual_size;
                     self.render_finished_size = requested_size;
+                    self.render_elapsed = Some(elapsed);
                     self.map_hits = map.hits;
                     self.map_rects = map.rects;
                 }
@@ -209,6 +214,7 @@ impl DiskApp {
             self.render_generation.fetch_add(1, Ordering::Relaxed);
             self.render_progress = None;
             self.render_requested_size = size;
+            self.render_elapsed = None;
             self.render_requested_at = std::time::Instant::now();
         }
         let limit_reached = self
@@ -520,13 +526,15 @@ impl eframe::App for DiskApp {
                         human_size(self.progress_bytes)
                     ));
                 } else if let Some((phase, _, _)) = map_progress.filter(|(phase, _, _)| {
-                    *phase == treemap::PHASE_PREPARE || *phase == treemap::PHASE_LAYOUT
+                    *phase == treemap::PHASE_PREPARE
+                        || *phase == treemap::PHASE_LAYOUT
+                        || *phase == treemap::PHASE_RASTER
                 }) {
                     ui.separator();
-                    ui.label(if phase == treemap::PHASE_PREPARE {
-                        "Подготовка treemap"
-                    } else {
-                        "Раскладка плиток"
+                    ui.label(match phase {
+                        treemap::PHASE_PREPARE => "Подготовка treemap",
+                        treemap::PHASE_LAYOUT => "Раскладка плиток",
+                        _ => "Отрисовка treemap",
                     });
                 } else if map_progress.is_some_and(|(phase, _, _)| phase == treemap::PHASE_LIMIT) {
                     ui.separator();
@@ -550,23 +558,29 @@ impl eframe::App for DiskApp {
                 };
                 ui.add(bar);
             } else if let Some((phase, done, total)) = map_progress.filter(|(phase, _, _)| {
-                *phase == treemap::PHASE_PREPARE || *phase == treemap::PHASE_LAYOUT
+                *phase == treemap::PHASE_PREPARE
+                    || *phase == treemap::PHASE_LAYOUT
+                    || *phase == treemap::PHASE_RASTER
             }) {
                 let fraction = if total == 0 {
                     0.0
                 } else {
                     (done as f32 / total as f32).clamp(0.0, 1.0)
                 };
-                let label = if phase == treemap::PHASE_PREPARE {
-                    "Подготовка treemap"
-                } else {
-                    "Раскладка плиток"
+                let label = match phase {
+                    treemap::PHASE_PREPARE => "Подготовка treemap",
+                    treemap::PHASE_LAYOUT => "Раскладка плиток",
+                    _ => "Отрисовка treemap",
                 };
                 ui.add(egui::ProgressBar::new(fraction).text(format!("{label}: {done}/{total}")));
             } else if self.result.is_some() {
                 // Keep the status panel's height fixed while the map worker starts,
                 // finishes, or is restarted for a resized viewport.
-                ui.add(egui::ProgressBar::new(1.0).text("Treemap ready"));
+                let label = self.render_elapsed.map_or_else(
+                    || "Treemap ready".to_owned(),
+                    |elapsed| format!("Treemap ready · {:.2} s", elapsed.as_secs_f64()),
+                );
+                ui.add(egui::ProgressBar::new(1.0).text(label));
             }
         });
 

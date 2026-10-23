@@ -190,6 +190,50 @@ impl TreeBuilder {
         }
         self.nodes
     }
+
+    pub fn merge_finished_shards(mut shards: Vec<Vec<Node>>) -> Vec<Node> {
+        assert!(!shards.is_empty());
+        let mut merged = shards.remove(0);
+        for shard in shards {
+            if shard.len() <= 1 {
+                continue;
+            }
+            let offset = merged.len() - 1;
+            let shard_root = &shard[0];
+            merged[0].size = merged[0].size.saturating_add(shard_root.size);
+            merged[0].files = merged[0].files.saturating_add(shard_root.files);
+            merged[0].folders = merged[0].folders.saturating_add(shard_root.folders);
+            if let Some(modified) = shard_root.modified {
+                merged[0].modified =
+                    Some(merged[0].modified.map_or(modified, |old| old.max(modified)));
+            }
+            merged[0]
+                .children
+                .extend(shard_root.children.iter().map(|&child| child + offset));
+
+            for mut node in shard.into_iter().skip(1) {
+                if let Some(parent) = &mut node.parent {
+                    if *parent != 0 {
+                        *parent += offset;
+                    }
+                }
+                for child in &mut node.children {
+                    *child += offset;
+                }
+                merged.push(node);
+            }
+        }
+        let mut root_children = std::mem::take(&mut merged[0].children);
+        root_children.sort_by(|&a, &b| {
+            merged[b]
+                .size
+                .cmp(&merged[a].size)
+                .then_with(|| cmp_ascii_case_insensitive(&merged[a].name, &merged[b].name))
+                .then_with(|| merged[a].name.cmp(&merged[b].name))
+        });
+        merged[0].children = root_children;
+        merged
+    }
 }
 
 fn cmp_ascii_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
@@ -214,4 +258,67 @@ fn path_key(path: &Path) -> String {
     #[cfg(windows)]
     value.make_ascii_lowercase();
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn summary(
+        nodes: &[Node],
+    ) -> HashMap<PathBuf, (u64, bool, u64, u64, Option<PathBuf>, Vec<PathBuf>)> {
+        nodes
+            .iter()
+            .map(|node| {
+                let parent = node.parent.map(|index| nodes[index].path.clone());
+                let mut children: Vec<_> = node
+                    .children
+                    .iter()
+                    .map(|&index| nodes[index].path.clone())
+                    .collect();
+                children.sort();
+                (
+                    node.path.clone(),
+                    (
+                        node.size,
+                        node.is_dir,
+                        node.files,
+                        node.folders,
+                        parent,
+                        children,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merging_independent_shards_preserves_tree_totals_and_links() {
+        let root = PathBuf::from("root");
+        let alpha = root.join("Alpha");
+        let alpha_file = alpha.join("one.bin");
+        let nested_file = alpha.join("Nested").join("two.bin");
+        let beta = root.join("Beta");
+        let beta_file = beta.join("three.bin");
+
+        let mut sequential = TreeBuilder::new(root.clone());
+        sequential.add(alpha_file.clone(), false, 100, None, 0);
+        sequential.add(nested_file.clone(), false, 250, None, 0);
+        sequential.add(beta_file.clone(), false, 50, None, 0);
+        let expected = summary(&sequential.finish());
+
+        let mut alpha_shard = TreeBuilder::new(root.clone());
+        alpha_shard.add(alpha_file, false, 100, None, 0);
+        alpha_shard.add(nested_file, false, 250, None, 0);
+        let mut beta_shard = TreeBuilder::new(root);
+        beta_shard.add(beta_file, false, 50, None, 0);
+        let actual = summary(&TreeBuilder::merge_finished_shards(vec![
+            alpha_shard.finish(),
+            beta_shard.finish(),
+            TreeBuilder::new(PathBuf::from("root")).finish(),
+        ]));
+
+        assert_eq!(actual, expected);
+    }
 }

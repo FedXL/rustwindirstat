@@ -7,6 +7,7 @@ description = "Fast Windows disk usage analyzer with an NTFS MFT fast path"
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 walkdir = "2.5"
+rayon = "1.11"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 
 [target.'cfg(windows)'.dependencies]
