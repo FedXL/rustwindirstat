@@ -5,7 +5,7 @@ Development branch: `refactor/responsive-core`. The published 1.01 binary is the
 - Only one scan is active. Cancelling a scan does not start the fallback scanner. Search results are invalidated whenever the scan snapshot changes.
 - Directory rows are cached until the snapshot, expansion, or sorting changes. Names use one normalized sort key per entry during sorting.
 - Selecting a tile centers its directory row using the same row spacing as the virtualized list, including for rows far outside the previous viewport.
-- Search runs on one background worker with cancellation, a 150 ms debounce, and a bounded heap of 500 largest matches. ASCII searches do not allocate a lowercase full path per entry.
+- Search runs on one background worker with cancellation, a 150 ms debounce, and a bounded heap of 500 largest matches. ASCII paths and queries use a comparison without lowercase string allocations; Unicode searches preserve the existing lowercase semantics.
 - Treemap workers report cancellation and failures separately. Terminal failures do not automatically restart the same render. Layout uses pixel-area aspect ratios; serial and parallel rendering share the pixel kernel.
 - The application reuses one bounded Rayon pool. Scan batches reuse staging buffers. Directory lookup keys preserve native Windows names and case-sensitive entries.
 - Deletion runs in a background job. Windows shell actions preserve native paths. Fonts are loaded from the Windows directory at runtime.

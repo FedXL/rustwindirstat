@@ -112,7 +112,7 @@ fn find_matches(
             return Vec::new();
         }
         let path = node.path.to_string_lossy();
-        let matches = if query.is_ascii() {
+        let matches = if query.is_ascii() && path.is_ascii() {
             path.as_bytes()
                 .windows(query.len())
                 .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
@@ -160,6 +160,15 @@ mod tests {
         assert_eq!(nodes[results[0].0].size, 600);
         assert_eq!(nodes[results[RESULT_LIMIT - 1].0].size, 101);
         assert!(find_matches(&nodes, "file", &AtomicU64::new(1), 0).is_empty());
+        let mut builder = TreeBuilder::new("root".into());
+        builder.add(PathBuf::from("root/K.txt"), false, 1, None, 0);
+        builder.add(PathBuf::from("root/ПРИМЕР.txt"), false, 2, None, 0);
+        let unicode = builder.finish();
+        assert_eq!(find_matches(&unicode, "k", &AtomicU64::new(0), 0).len(), 1);
+        assert_eq!(
+            find_matches(&unicode, "пример", &AtomicU64::new(0), 0).len(),
+            1
+        );
     }
 
     #[test]
