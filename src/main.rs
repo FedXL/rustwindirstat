@@ -1,17 +1,21 @@
+mod actions;
+mod map_view;
 mod model;
 mod parallel;
+mod paths;
 mod scanner;
+mod search;
+mod tree_view;
 mod treemap;
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, Vec2};
 use model::Node;
-use scanner::{ScanEvent, ScanResult, scan_async};
-use std::collections::HashSet;
+use scanner::{ScanError, ScanEvent, ScanResult, ScanTask, scan_async};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
+use tree_view::{SortColumn, TreeView};
 
 fn main() -> eframe::Result {
     let start_path = std::env::args()
@@ -35,73 +39,66 @@ fn main() -> eframe::Result {
 
 struct DiskApp {
     root: String,
-    search: String,
-    last_search: String,
-    search_results: Vec<usize>,
-    scan_rx: Option<Receiver<ScanEvent>>,
-    cancel: Option<Arc<AtomicBool>>,
+    search: search::SearchState,
+    scan_task: Option<ScanTask>,
+    scan_revision: u64,
     result: Option<ScanResult>,
     selected: usize,
     status: String,
     progress_files: u64,
+    progress_processed: u64,
     progress_total: Option<u64>,
     progress_bytes: u64,
     scan_phase: String,
     error: Option<String>,
     confirm_delete: bool,
     delete_target: Option<PathBuf>,
+    delete_task: Option<actions::DeleteTask>,
     admin_offer: bool,
-    expanded: HashSet<usize>,
+    tree: TreeView,
     scroll_to_selected: bool,
-    sort_column: SortColumn,
-    sort_descending: bool,
-    render_generation: Arc<std::sync::atomic::AtomicU64>,
-    render_rx: Option<Receiver<(u64, [usize; 2], treemap::RenderedMap)>>,
-    render_tx: Sender<(u64, [usize; 2], treemap::RenderedMap)>,
-    render_running: Arc<AtomicBool>,
-    render_progress: Option<Arc<treemap::RenderProgress>>,
-    render_size: [usize; 2],
-    render_requested_size: [usize; 2],
-    render_finished_size: [usize; 2],
-    render_elapsed: Option<Duration>,
-    render_requested_at: std::time::Instant,
-    map_texture: Option<egui::TextureHandle>,
-    map_hits: Vec<u32>,
-    map_rects: Vec<treemap::PackedRect>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortColumn {
-    Name,
-    Percent,
-    Size,
-    Items,
-    Files,
-    Folders,
-    Modified,
-    Attributes,
+    map: map_view::MapView,
 }
 
 const TREE_COLUMN_WIDTHS: [f32; 8] = [420.0, 125.0, 105.0, 85.0, 80.0, 90.0, 160.0, 65.0];
 const TREE_ROW_HEIGHT: f32 = 28.0;
-const TREE_CONTENT_WIDTH: f32 = 1130.0;
+const TREE_COLUMNS: [(&str, SortColumn); 8] = [
+    ("Имя", SortColumn::Name),
+    ("Доля", SortColumn::Percent),
+    ("Размер", SortColumn::Size),
+    ("Элементы", SortColumn::Items),
+    ("Файлы", SortColumn::Files),
+    ("Папки", SortColumn::Folders),
+    ("Изменён", SortColumn::Modified),
+    ("Атрибуты", SortColumn::Attributes),
+];
+const TREE_CONTENT_WIDTH: f32 = {
+    let mut total = 0.0;
+    let mut index = 0;
+    while index < TREE_COLUMN_WIDTHS.len() {
+        total += TREE_COLUMN_WIDTHS[index];
+        index += 1;
+    }
+    total
+};
 
 impl DiskApp {
     fn new(cc: &eframe::CreationContext<'_>, root: String) -> Self {
-        let (render_tx, render_rx) = std::sync::mpsc::channel();
         cc.egui_ctx.set_theme(egui::ThemePreference::Light);
         let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "segoe_ui".to_owned(),
-            std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
-                r"C:\Windows\Fonts\segoeui.ttf"
-            ))),
-        );
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "segoe_ui".to_owned());
+        if let Some(windows) = std::env::var_os("WINDIR")
+            && let Ok(bytes) = std::fs::read(PathBuf::from(windows).join("Fonts/segoeui.ttf"))
+        {
+            fonts.font_data.insert(
+                "segoe_ui".to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "segoe_ui".to_owned());
+        }
         cc.egui_ctx.set_fonts(fonts);
         let mut style = (*cc.egui_ctx.style_of(egui::Theme::Light)).clone();
         style.spacing.item_spacing = Vec2::new(5.0, 3.0);
@@ -123,47 +120,49 @@ impl DiskApp {
         cc.egui_ctx.set_style_of(egui::Theme::Light, style);
         Self {
             root,
-            search: String::new(),
-            last_search: String::new(),
-            search_results: Vec::new(),
-            scan_rx: None,
-            cancel: None,
+            search: search::SearchState::default(),
+            scan_task: None,
+            scan_revision: 0,
             result: None,
             selected: 0,
             status: "Укажите диск или папку и нажмите «Сканировать». Для быстрого сканирования NTFS запустите программу от имени администратора.".to_owned(),
             progress_files: 0,
+            progress_processed: 0,
             progress_total: None,
             progress_bytes: 0,
             scan_phase: String::new(),
             error: None,
             confirm_delete: false,
             delete_target: None,
+            delete_task: None,
             admin_offer: false,
-            expanded: HashSet::from([0]),
+            tree: TreeView::default(),
             scroll_to_selected: false,
-            sort_column: SortColumn::Size,
-            sort_descending: true,
-            render_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            render_rx: Some(render_rx), render_tx, render_size: [0, 0], render_requested_size: [0, 0],
-            render_running: Arc::new(AtomicBool::new(false)), render_progress: None, render_finished_size: [0,0],
-            render_elapsed: None, render_requested_at: std::time::Instant::now(), map_texture: None, map_hits: Vec::new(), map_rects: Vec::new(),
+            map: map_view::MapView::default(),
         }
     }
 
     fn start_scan(&mut self) {
+        if self.scan_task.is_some() || self.delete_task.is_some() {
+            return;
+        }
         let root = PathBuf::from(self.root.trim());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        scan_async(root, tx, cancel.clone());
-        self.scan_rx = Some(rx);
-        self.cancel = Some(cancel);
+        match scan_async(root) {
+            Ok(task) => self.scan_task = Some(task),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.status = error.to_string();
+                return;
+            }
+        }
+        self.scan_revision += 1;
         self.result = None;
-        self.invalidate_map();
+        self.map.invalidate();
         self.selected = 0;
-        self.expanded.clear();
-        self.expanded.insert(0);
+        self.tree.collapse_all();
         self.scroll_to_selected = false;
         self.progress_files = 0;
+        self.progress_processed = 0;
         self.progress_total = None;
         self.progress_bytes = 0;
         self.error = None;
@@ -172,116 +171,23 @@ impl DiskApp {
         self.status = self.scan_phase.clone();
     }
 
-    fn invalidate_map(&mut self) {
-        self.render_generation.fetch_add(1, Ordering::Relaxed);
-        self.render_size = [0, 0];
-        self.render_requested_size = [0, 0];
-        self.render_finished_size = [0, 0];
-        self.render_elapsed = None;
-        self.map_texture = None;
-        self.map_hits.clear();
-        self.map_rects.clear();
-        self.render_progress = None;
-    }
-
-    fn poll_map(&mut self, ctx: &egui::Context, size: [usize; 2]) {
-        if let Some(rx) = &self.render_rx {
-            while let Ok((generation, requested_size, map)) = rx.try_recv() {
-                if generation == self.render_generation.load(Ordering::Relaxed) {
-                    let elapsed = map.elapsed;
-                    let actual_size = map.image.size;
-                    if let Some(texture) = &mut self.map_texture {
-                        texture.set(map.image, egui::TextureOptions::LINEAR);
-                    } else {
-                        self.map_texture = Some(ctx.load_texture(
-                            "treemap",
-                            map.image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
-                    self.render_size = actual_size;
-                    self.render_finished_size = requested_size;
-                    self.render_elapsed = Some(elapsed);
-                    self.map_hits = map.hits;
-                    self.map_rects = map.rects;
-                }
-            }
-        }
-        if self.result.is_none() || size[0] == 0 || size[1] == 0 {
-            return;
-        }
-        if size != self.render_requested_size {
-            self.render_generation.fetch_add(1, Ordering::Relaxed);
-            self.render_progress = None;
-            self.render_requested_size = size;
-            self.render_elapsed = None;
-            self.render_requested_at = std::time::Instant::now();
-        }
-        let limit_reached = self
-            .render_progress
-            .as_ref()
-            .is_some_and(|p| p.snapshot().0 == treemap::PHASE_LIMIT);
-        if self.render_finished_size != size
-            && self.render_requested_size == size
-            && !limit_reached
-            && self.render_requested_at.elapsed() > Duration::from_millis(140)
-            && self
-                .render_running
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-        {
-            let generation = self.render_generation.fetch_add(1, Ordering::Relaxed) + 1;
-            let nodes = self.result.as_ref().unwrap().nodes.clone();
-            let tx = self.render_tx.clone();
-            let cancel = self.render_generation.clone();
-            let running = self.render_running.clone();
-            let progress = Arc::new(treemap::RenderProgress::default());
-            self.render_progress = Some(progress.clone());
-            let requested_size = size;
-            let (w, h) = (size[0], size[1]);
-            std::thread::spawn(move || {
-                struct RunningGuard(Arc<AtomicBool>);
-                impl Drop for RunningGuard {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
-                    }
-                }
-                let _guard = RunningGuard(running);
-                if let Some(map) =
-                    treemap::render(nodes, w, h, cancel.clone(), generation, progress)
-                {
-                    if cancel.load(Ordering::Relaxed) == generation {
-                        let _ = tx.send((generation, requested_size, map));
-                    }
-                }
-            });
-        }
-        let terminal_limit = self
-            .render_progress
-            .as_ref()
-            .is_some_and(|p| p.snapshot().0 == treemap::PHASE_LIMIT);
-        if self.render_running.load(Ordering::Relaxed)
-            || (self.render_finished_size != size && !terminal_limit)
-        {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-    }
-
     fn poll_scan(&mut self) {
         let mut finished = false;
-        if let Some(rx) = &self.scan_rx {
+        if let Some(task) = &self.scan_task {
             loop {
-                match rx.try_recv() {
+                match task.try_recv() {
                     Ok(ScanEvent::Progress {
                         files,
+                        processed,
                         total,
                         bytes,
                         phase,
                     }) => {
                         self.progress_files = files;
+                        self.progress_processed = processed;
                         self.progress_total = total;
                         self.progress_bytes = bytes;
-                        self.scan_phase = phase;
+                        self.scan_phase = phase.label().to_owned();
                     }
                     Ok(ScanEvent::MftFallback {
                         reason,
@@ -308,13 +214,21 @@ impl DiskApp {
                                         ""
                                     }
                                 );
-                                self.expanded.clear();
-                                self.expanded.insert(0);
+                                let skipped =
+                                    result.warnings.skipped + result.warnings.corrupt_records;
+                                if skipped > 0 {
+                                    self.status.push_str(&format!("  •  Пропущено: {skipped}"));
+                                }
+                                self.tree.collapse_all();
+                                self.scan_revision += 1;
                                 self.result = Some(result);
                             }
+                            Err(ScanError::Cancelled) => {
+                                self.status = "Сканирование остановлено".to_owned()
+                            }
                             Err(error) => {
-                                self.status = error.clone();
-                                self.error = Some(error);
+                                self.status = error.to_string();
+                                self.error = Some(error.to_string());
                             }
                         }
                     }
@@ -327,32 +241,7 @@ impl DiskApp {
             }
         }
         if finished {
-            self.scan_rx = None;
-            self.cancel = None;
-        }
-    }
-
-    fn refresh_search(&mut self) {
-        if self.search == self.last_search {
-            return;
-        }
-        self.last_search.clone_from(&self.search);
-        self.search_results.clear();
-        let query = self.search.trim().to_lowercase();
-        if query.is_empty() {
-            return;
-        }
-        if let Some(result) = &self.result {
-            self.search_results = result
-                .nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| node.path.to_string_lossy().to_lowercase().contains(&query))
-                .map(|(index, _)| index)
-                .collect();
-            self.search_results
-                .sort_by(|a, b| result.nodes[*b].size.cmp(&result.nodes[*a].size));
-            self.search_results.truncate(500);
+            self.scan_task = None;
         }
     }
 
@@ -371,26 +260,45 @@ impl DiskApp {
             return;
         }
         self.selected = index;
-        self.search.clear();
+        self.search.query.clear();
         let mut ancestor = nodes[index].parent;
         while let Some(parent) = ancestor {
-            self.expanded.insert(parent);
+            self.tree.expand(parent);
             ancestor = nodes[parent].parent;
         }
         self.scroll_to_selected = true;
     }
 
-    fn open_selected(&self) {
-        if let Some(path) = self.selected_path() {
-            #[cfg(windows)]
-            {
-                let mut command = std::process::Command::new("explorer.exe");
-                if path.is_file() {
-                    command.arg(format!("/select,{}", path.display()));
-                } else {
-                    command.arg(path);
+    fn open_selected(&mut self) {
+        #[cfg(windows)]
+        if let Some(node) = self
+            .result
+            .as_ref()
+            .and_then(|result| result.nodes.get(self.selected))
+            && let Err(error) = actions::open(&node.path, node.is_dir)
+        {
+            self.status = error;
+        }
+    }
+
+    fn poll_delete(&mut self) {
+        if let Some(result) = self
+            .delete_task
+            .as_ref()
+            .and_then(actions::DeleteTask::poll)
+        {
+            self.delete_task = None;
+            match result {
+                Ok(()) => {
+                    self.result = None;
+                    self.scan_revision += 1;
+                    self.map.invalidate();
+                    self.tree.collapse_all();
+                    self.selected = 0;
+                    self.status =
+                        "Объект удалён. Просканируйте папку для обновления результатов.".to_owned();
                 }
-                let _ = command.spawn();
+                Err(error) => self.status = error,
             }
         }
     }
@@ -399,9 +307,21 @@ impl DiskApp {
 impl eframe::App for DiskApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_scan();
-        self.refresh_search();
-        let is_scanning = self.scan_rx.is_some();
-        let map_progress = self.render_progress.as_ref().map(|p| p.snapshot());
+        self.poll_delete();
+        if self.search.update(
+            self.result.as_ref().map(|result| &result.nodes),
+            self.scan_revision,
+        ) {
+            ui.ctx().request_repaint_after(Duration::from_millis(40));
+        }
+        let is_scanning = self.scan_task.is_some();
+        let is_busy = is_scanning || self.delete_task.is_some();
+        let map_progress = self
+            .map
+            .progress
+            .as_ref()
+            .filter(|_| self.map.error.is_none())
+            .map(|p| p.snapshot());
         let mut start = false;
         let mut cancel = false;
         let mut open_selected = false;
@@ -410,7 +330,10 @@ impl eframe::App for DiskApp {
         egui::Panel::top("menubar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("Файл", |ui| {
-                    if ui.button("Сканировать").clicked() {
+                    if ui
+                        .add_enabled(!is_busy, egui::Button::new("Сканировать"))
+                        .clicked()
+                    {
                         start = true;
                         ui.close();
                     }
@@ -430,7 +353,7 @@ impl eframe::App for DiskApp {
                 ui.menu_button("Очистка", |ui| {
                     if ui
                         .add_enabled(
-                            self.selected != 0 && self.result.is_some(),
+                            self.selected != 0 && self.result.is_some() && !is_busy,
                             egui::Button::new("Удалить выбранный объект…"),
                         )
                         .clicked()
@@ -444,12 +367,11 @@ impl eframe::App for DiskApp {
                 });
                 ui.menu_button("Структура каталогов", |ui| {
                     if ui.button("Развернуть корень").clicked() {
-                        self.expanded.insert(0);
+                        self.tree.expand(0);
                         ui.close();
                     }
                     if ui.button("Свернуть всё").clicked() {
-                        self.expanded.clear();
-                        self.expanded.insert(0);
+                        self.tree.collapse_all();
                         ui.close();
                     }
                 });
@@ -470,7 +392,7 @@ impl eframe::App for DiskApp {
                 ui.label("Путь:");
                 ui.add(egui::TextEdit::singleline(&mut self.root).desired_width(340.0));
                 if ui
-                    .add_enabled(!is_scanning, egui::Button::new("Сканировать"))
+                    .add_enabled(!is_busy, egui::Button::new("Сканировать"))
                     .clicked()
                 {
                     start = true;
@@ -486,7 +408,7 @@ impl eframe::App for DiskApp {
                 }
                 if ui
                     .add_enabled(
-                        self.selected != 0 && !is_scanning,
+                        self.selected != 0 && self.result.is_some() && !is_busy,
                         egui::Button::new("Удалить…"),
                     )
                     .clicked()
@@ -497,7 +419,7 @@ impl eframe::App for DiskApp {
                     #[cfg(windows)]
                     if ui.button("Перезапустить от администратора").clicked()
                     {
-                        match scanner::relaunch_elevated(PathBuf::from(self.root.trim()).as_path())
+                        match actions::relaunch_elevated(PathBuf::from(self.root.trim()).as_path())
                         {
                             Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
                             Err(error) => self.status = error,
@@ -507,14 +429,24 @@ impl eframe::App for DiskApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Поиск:");
-                ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(340.0));
+                ui.add(egui::TextEdit::singleline(&mut self.search.query).desired_width(340.0));
                 ui.label("по имени или пути");
+                if let Some(error) = &self.search.error {
+                    ui.label(format!("Ошибка поиска: {error}"));
+                }
             });
         });
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(&self.status);
+                let response = ui.label(&self.status);
+                if let Some(result) = &self.result {
+                    response.on_hover_text(format!(
+                        "{}\n{}",
+                        result.timings.describe(),
+                        result.warnings.examples.join("\n")
+                    ));
+                }
                 if is_scanning {
                     ui.separator();
                     ui.label(format!(
@@ -522,18 +454,23 @@ impl eframe::App for DiskApp {
                         self.scan_phase,
                         human_size(self.progress_bytes)
                     ));
+                } else if let Some(error) = &self.map.error {
+                    ui.separator();
+                    ui.label(format!("Ошибка treemap: {error}"));
                 } else if let Some((phase, _, _)) = map_progress.filter(|(phase, _, _)| {
-                    *phase == treemap::PHASE_PREPARE
-                        || *phase == treemap::PHASE_LAYOUT
-                        || *phase == treemap::PHASE_RASTER
+                    *phase == treemap::RenderPhase::Preparing
+                        || *phase == treemap::RenderPhase::Layout
+                        || *phase == treemap::RenderPhase::Raster
                 }) {
                     ui.separator();
                     ui.label(match phase {
-                        treemap::PHASE_PREPARE => "Подготовка treemap",
-                        treemap::PHASE_LAYOUT => "Раскладка плиток",
+                        treemap::RenderPhase::Preparing => "Подготовка treemap",
+                        treemap::RenderPhase::Layout => "Раскладка плиток",
                         _ => "Отрисовка treemap",
                     });
-                } else if map_progress.is_some_and(|(phase, _, _)| phase == treemap::PHASE_LIMIT) {
+                } else if map_progress
+                    .is_some_and(|(phase, _, _)| phase == treemap::RenderPhase::Limited)
+                {
                     ui.separator();
                     ui.label("Treemap: превышен лимит временной памяти");
                 }
@@ -543,7 +480,7 @@ impl eframe::App for DiskApp {
                     if total == 0 {
                         0.0
                     } else {
-                        (self.progress_files as f32 / total as f32).clamp(0.0, 1.0)
+                        (self.progress_processed as f32 / total as f32).clamp(0.0, 1.0)
                     }
                 });
                 let bar = match fraction {
@@ -555,9 +492,9 @@ impl eframe::App for DiskApp {
                 };
                 ui.add(bar);
             } else if let Some((phase, done, total)) = map_progress.filter(|(phase, _, _)| {
-                *phase == treemap::PHASE_PREPARE
-                    || *phase == treemap::PHASE_LAYOUT
-                    || *phase == treemap::PHASE_RASTER
+                *phase == treemap::RenderPhase::Preparing
+                    || *phase == treemap::RenderPhase::Layout
+                    || *phase == treemap::RenderPhase::Raster
             }) {
                 let fraction = if total == 0 {
                     0.0
@@ -565,15 +502,15 @@ impl eframe::App for DiskApp {
                     (done as f32 / total as f32).clamp(0.0, 1.0)
                 };
                 let label = match phase {
-                    treemap::PHASE_PREPARE => "Подготовка treemap",
-                    treemap::PHASE_LAYOUT => "Раскладка плиток",
+                    treemap::RenderPhase::Preparing => "Подготовка treemap",
+                    treemap::RenderPhase::Layout => "Раскладка плиток",
                     _ => "Отрисовка treemap",
                 };
                 ui.add(egui::ProgressBar::new(fraction).text(format!("{label}: {done}/{total}")));
-            } else if self.result.is_some() {
+            } else if self.result.is_some() && self.map.error.is_none() {
                 // Keep the status panel's height fixed while the map worker starts,
                 // finishes, or is restarted for a resized viewport.
-                let label = self.render_elapsed.map_or_else(
+                let label = self.map.elapsed.map_or_else(
                     || "Treemap ready".to_owned(),
                     |elapsed| format!("Treemap ready · {:.2} s", elapsed.as_secs_f64()),
                 );
@@ -587,19 +524,13 @@ impl eframe::App for DiskApp {
             .min_size(170.0)
             .show(ui, |ui| {
                 if let Some(result) = &self.result {
-                    let rows = if self.search.trim().is_empty() {
-                        collect_visible_rows(
-                            &result.nodes,
-                            &self.expanded,
-                            self.sort_column,
-                            self.sort_descending,
-                        )
+                    self.tree.update(&result.nodes, self.scan_revision);
+                    let rows = if self.search.query.trim().is_empty() {
+                        self.tree.rows()
                     } else {
-                        self.search_results
-                            .iter()
-                            .map(|&index| (index, 0))
-                            .collect()
+                        self.search.results.as_slice()
                     };
+                    let mut toggled_nodes = Vec::new();
                     let scroll_row = if self.scroll_to_selected {
                         rows.iter().position(|(index, _)| *index == self.selected)
                     } else {
@@ -610,81 +541,22 @@ impl eframe::App for DiskApp {
                         ui.set_min_width(TREE_CONTENT_WIDTH);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 0.0;
-                            sort_header(
-                                ui,
-                                "Имя",
-                                420.0,
-                                SortColumn::Name,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Доля",
-                                125.0,
-                                SortColumn::Percent,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Размер",
-                                105.0,
-                                SortColumn::Size,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Элементы",
-                                85.0,
-                                SortColumn::Items,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Файлы",
-                                80.0,
-                                SortColumn::Files,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Папки",
-                                90.0,
-                                SortColumn::Folders,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Изменён",
-                                160.0,
-                                SortColumn::Modified,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
-                            sort_header(
-                                ui,
-                                "Атрибуты",
-                                65.0,
-                                SortColumn::Attributes,
-                                &self.sort_column,
-                                self.sort_descending,
-                                &mut clicked_sort,
-                            );
+                            for ((title, column), width) in
+                                TREE_COLUMNS.iter().zip(TREE_COLUMN_WIDTHS)
+                            {
+                                sort_header(
+                                    ui,
+                                    title,
+                                    width,
+                                    *column,
+                                    &self.tree.column,
+                                    self.tree.descending,
+                                    &mut clicked_sort,
+                                );
+                            }
                         });
                         if rows.is_empty() {
-                            ui.label(if self.search.trim().is_empty() {
+                            ui.label(if self.search.query.trim().is_empty() {
                                 "Результаты сканирования появятся здесь."
                             } else {
                                 "Совпадений нет."
@@ -692,11 +564,14 @@ impl eframe::App for DiskApp {
                         } else {
                             let mut row_scroll = egui::ScrollArea::vertical();
                             if let Some(row) = scroll_row {
-                                let visible_rows =
-                                    (ui.available_height() / TREE_ROW_HEIGHT).max(1.0);
-                                let centered_row = (row as f32 - visible_rows * 0.5).max(0.0);
-                                row_scroll = row_scroll
-                                    .vertical_scroll_offset(centered_row * TREE_ROW_HEIGHT);
+                                row_scroll = row_scroll.vertical_scroll_offset(
+                                    tree_view::centered_row_offset(
+                                        row,
+                                        ui.available_height(),
+                                        TREE_ROW_HEIGHT,
+                                        ui.spacing().item_spacing.y,
+                                    ),
+                                );
                             }
                             row_scroll.show_rows(ui, TREE_ROW_HEIGHT, rows.len(), |ui, range| {
                                 for row in range {
@@ -709,7 +584,7 @@ impl eframe::App for DiskApp {
                                         depth,
                                         result.nodes[0].size,
                                         self.selected == index,
-                                        self.expanded.contains(&index),
+                                        self.tree.is_expanded(index),
                                     );
                                     if scroll_row
                                         .is_some_and(|selected_row| rows[selected_row].0 == index)
@@ -719,8 +594,8 @@ impl eframe::App for DiskApp {
                                     if row_response.clicked() {
                                         self.selected = index;
                                     }
-                                    if toggled && !self.expanded.remove(&index) {
-                                        self.expanded.insert(index);
+                                    if toggled {
+                                        toggled_nodes.push(index);
                                     }
                                 }
                             });
@@ -729,13 +604,11 @@ impl eframe::App for DiskApp {
                             }
                         }
                     });
+                    for index in toggled_nodes {
+                        self.tree.toggle(index);
+                    }
                     if let Some(column) = clicked_sort {
-                        if self.sort_column == column {
-                            self.sort_descending = !self.sort_descending;
-                        } else {
-                            self.sort_column = column;
-                            self.sort_descending = column != SortColumn::Name;
-                        }
+                        self.tree.sort_by(column);
                     }
                 } else {
                     ui.label("Просканируйте диск или папку, чтобы увидеть содержимое.");
@@ -751,42 +624,42 @@ impl eframe::App for DiskApp {
                     (rect.width() * ppp).round().max(1.0) as usize,
                     (rect.height() * ppp).round().max(1.0) as usize,
                 ];
-                self.poll_map(ui.ctx(), physical);
-                if let Some(texture) = &self.map_texture {
+                self.map.poll(ui.ctx(), &nodes, physical);
+                if let Some(texture) = &self.map.texture {
                     ui.painter().image(
                         texture.id(),
                         rect,
                         Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         Color32::WHITE,
                     );
-                    if response.hovered() {
-                        if let Some(pointer) = response.hover_pos() {
-                            let x = ((pointer.x - rect.left()) / rect.width()
-                                * self.render_size[0] as f32)
-                                .floor()
-                                .max(0.0) as usize;
-                            let y = ((pointer.y - rect.top()) / rect.height()
-                                * self.render_size[1] as f32)
-                                .floor()
-                                .max(0.0) as usize;
-                            if let Some(&hit) = self.map_hits.get(y * self.render_size[0] + x) {
-                                if hit != u32::MAX {
-                                    let node = &nodes[hit as usize];
-                                    response.clone().on_hover_text(format!(
-                                        "{}\n{}",
-                                        node.path.display(),
-                                        human_size(node.size)
-                                    ));
-                                    if response.clicked() {
-                                        self.select_treemap_node(hit as usize);
-                                    }
-                                }
+                    if response.hovered()
+                        && let Some(pointer) = response.hover_pos()
+                    {
+                        let x = ((pointer.x - rect.left()) / rect.width() * self.map.size[0] as f32)
+                            .floor()
+                            .max(0.0) as usize;
+                        let y = ((pointer.y - rect.top()) / rect.height() * self.map.size[1] as f32)
+                            .floor()
+                            .max(0.0) as usize;
+                        if let Some(&hit) = self.map.hits.get(y * self.map.size[0] + x)
+                            && hit != u32::MAX
+                        {
+                            let Some(node) = nodes.get(hit as usize) else {
+                                return;
+                            };
+                            response.clone().on_hover_text(format!(
+                                "{}\n{}",
+                                node.path.display(),
+                                human_size(node.size)
+                            ));
+                            if response.clicked() {
+                                self.select_treemap_node(hit as usize);
                             }
                         }
                     }
-                    if let Some(r) = self.map_rects.get(self.selected) {
-                        let sx = rect.width() / self.render_size[0] as f32;
-                        let sy = rect.height() / self.render_size[1] as f32;
+                    if let Some(r) = self.map.rects.get(self.selected) {
+                        let sx = rect.width() / self.map.size[0] as f32;
+                        let sy = rect.height() / self.map.size[1] as f32;
                         let selected_rect = Rect::from_min_size(
                             egui::pos2(rect.left() + r.x as f32 * sx, rect.top() + r.y as f32 * sy),
                             Vec2::new(r.w as f32 * sx, r.h as f32 * sy),
@@ -820,19 +693,17 @@ impl eframe::App for DiskApp {
             self.start_scan();
         }
         if cancel {
-            if let Some(cancel) = &self.cancel {
-                cancel.store(true, Ordering::Relaxed);
+            if let Some(task) = &self.scan_task {
+                task.cancel();
             }
             self.status = "Останавливаю сканирование…".to_owned();
         }
         if open_selected {
             self.open_selected();
         }
-        if delete_selected {
-            if let Some(path) = self.selected_path() {
-                self.delete_target = Some(path.to_path_buf());
-                self.confirm_delete = true;
-            }
+        if delete_selected && let Some(path) = self.selected_path() {
+            self.delete_target = Some(path.to_path_buf());
+            self.confirm_delete = true;
         }
 
         if self.confirm_delete {
@@ -841,24 +712,21 @@ impl eframe::App for DiskApp {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ui.ctx(), |ui| {
-                    let path = self.delete_target.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                    let path = self
+                        .delete_target
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
                     ui.label("Удалить выбранный объект с диска?");
                     ui.label(path);
                     ui.horizontal(|ui| {
                         if ui.button("Удалить навсегда").clicked() {
                             if let Some(path) = self.delete_target.take() {
-                                let deleted = if path.is_dir() {
-                                    std::fs::remove_dir_all(&path)
-                                } else {
-                                    std::fs::remove_file(&path)
-                                };
-                                match deleted {
-                                    Ok(()) => {
-                                        self.status = "Объект удалён. Просканируйте путь ещё раз, чтобы обновить результаты.".to_owned();
-                                        self.result = None;
-                                    }
-                                    Err(error) => self.status = format!("Ошибка удаления: {error}"),
+                                match actions::DeleteTask::start(path) {
+                                    Ok(task) => self.delete_task = Some(task),
+                                    Err(error) => self.error = Some(error),
                                 }
+                                self.status = "Удаляю объект…".to_owned();
                             }
                             self.confirm_delete = false;
                         }
@@ -881,7 +749,7 @@ impl eframe::App for DiskApp {
                         #[cfg(windows)]
                         if ui.button("Перезапустить от администратора").clicked()
                         {
-                            match scanner::relaunch_elevated(
+                            match actions::relaunch_elevated(
                                 PathBuf::from(self.root.trim()).as_path(),
                             ) {
                                 Ok(()) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
@@ -895,7 +763,7 @@ impl eframe::App for DiskApp {
                 });
         }
 
-        if is_scanning {
+        if is_scanning || self.delete_task.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(80));
         }
     }
@@ -1134,38 +1002,6 @@ fn draw_directory_row(
         ),
     );
     (response, toggle)
-}
-
-fn collect_visible_rows(
-    nodes: &[Node],
-    expanded: &HashSet<usize>,
-    column: SortColumn,
-    descending: bool,
-) -> Vec<(usize, usize)> {
-    let mut rows = Vec::new();
-    let mut stack = vec![(0usize, 0usize)];
-    while let Some((index, depth)) = stack.pop() {
-        rows.push((index, depth));
-        if expanded.contains(&index) {
-            let mut children = nodes[index].children.clone();
-            children.sort_by(|&a, &b| compare_nodes(&nodes[a], &nodes[b], column, descending));
-            stack.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
-        }
-    }
-    rows
-}
-
-fn compare_nodes(a: &Node, b: &Node, column: SortColumn, descending: bool) -> std::cmp::Ordering {
-    let order = match column {
-        SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        SortColumn::Percent | SortColumn::Size => a.size.cmp(&b.size),
-        SortColumn::Items => (a.files + a.folders).cmp(&(b.files + b.folders)),
-        SortColumn::Files => a.files.cmp(&b.files),
-        SortColumn::Folders => a.folders.cmp(&b.folders),
-        SortColumn::Modified => a.modified.cmp(&b.modified),
-        SortColumn::Attributes => a.attributes.cmp(&b.attributes),
-    };
-    if descending { order.reverse() } else { order }
 }
 
 fn format_modified(value: Option<std::time::SystemTime>) -> String {

@@ -1,3 +1,4 @@
+use crate::paths::{normalize, normalize_owned};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -19,19 +20,20 @@ pub struct Node {
 #[derive(Debug)]
 pub struct TreeBuilder {
     nodes: Vec<Node>,
-    by_path: HashMap<String, usize>,
+    by_path: HashMap<PathBuf, usize>,
     root: PathBuf,
 }
 
 impl TreeBuilder {
     pub fn new(root: PathBuf) -> Self {
+        let root = normalize(&root);
         let name = root
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| root.display().to_string());
-        let key = path_key(&root);
+        let key = root.clone();
         let root_node = Node {
             name,
             path: root.clone(),
@@ -59,8 +61,8 @@ impl TreeBuilder {
         modified: Option<SystemTime>,
         attributes: u32,
     ) {
-        let path = clean_path(path);
-        let key = path_key(&path);
+        let path = normalize_owned(path);
+        let key = path.clone();
         if let Some(&existing) = self.by_path.get(&key) {
             let node = &mut self.nodes[existing];
             if !is_dir {
@@ -83,7 +85,7 @@ impl TreeBuilder {
         let index = self.nodes.len();
         self.nodes.push(Node {
             name,
-            path: path.clone(),
+            path,
             size: if is_dir { 0 } else { size },
             is_dir,
             parent: Some(parent),
@@ -103,7 +105,7 @@ impl TreeBuilder {
         let mut known = 0;
 
         while let Some(parent_path) = cursor {
-            if let Some(&index) = self.by_path.get(&path_key(parent_path)) {
+            if let Some(&index) = self.by_path.get(parent_path) {
                 known = index;
                 break;
             }
@@ -116,7 +118,7 @@ impl TreeBuilder {
         }
 
         for dir_path in missing.into_iter().rev() {
-            let key = path_key(&dir_path);
+            let key = dir_path.clone();
             if let Some(&index) = self.by_path.get(&key) {
                 known = index;
                 continue;
@@ -147,6 +149,7 @@ impl TreeBuilder {
     }
 
     pub fn finish(mut self) -> Vec<Node> {
+        drop(std::mem::take(&mut self.by_path));
         // TreeBuilder always creates parents before descendants. Folding in reverse
         // insertion order is a postorder traversal without a depth array or N log N sort.
         for index in (1..self.nodes.len()).rev() {
@@ -212,10 +215,10 @@ impl TreeBuilder {
                 .extend(shard_root.children.iter().map(|&child| child + offset));
 
             for mut node in shard.into_iter().skip(1) {
-                if let Some(parent) = &mut node.parent {
-                    if *parent != 0 {
-                        *parent += offset;
-                    }
+                if let Some(parent) = &mut node.parent
+                    && *parent != 0
+                {
+                    *parent += offset;
                 }
                 for child in &mut node.children {
                     *child += offset;
@@ -242,32 +245,24 @@ fn cmp_ascii_case_insensitive(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
-fn clean_path(path: PathBuf) -> PathBuf {
-    #[cfg(windows)]
-    {
-        let text = path.to_string_lossy();
-        if let Some(stripped) = text.strip_prefix(r"\\.\") {
-            return PathBuf::from(stripped);
-        }
-    }
-    path
-}
-
-fn path_key(path: &Path) -> String {
-    let mut value = path.to_string_lossy().replace('/', "\\");
-    #[cfg(windows)]
-    value.make_ascii_lowercase();
-    value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn summary(
-        nodes: &[Node],
-    ) -> HashMap<PathBuf, (u64, bool, u64, u64, Option<PathBuf>, Vec<PathBuf>)> {
+    #[test]
+    fn distinct_case_sensitive_entries_remain_separate() {
+        let root = PathBuf::from("root");
+        let mut builder = TreeBuilder::new(root.clone());
+        builder.add(root.join("A.txt"), false, 10, None, 0);
+        builder.add(root.join("a.txt"), false, 20, None, 0);
+        let nodes = builder.finish();
+        assert_eq!(nodes[0].files, 2);
+        assert_eq!(nodes[0].size, 30);
+    }
+
+    type Summary = (u64, bool, u64, u64, Option<PathBuf>, Vec<PathBuf>);
+    fn summary(nodes: &[Node]) -> HashMap<PathBuf, Summary> {
         nodes
             .iter()
             .map(|node| {
