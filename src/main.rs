@@ -691,7 +691,7 @@ impl eframe::App for DiskApp {
                                 for row in range {
                                     let (index, depth) = rows[row];
                                     let node = &result.nodes[index];
-                                    let (clicked, toggled) = draw_directory_row(
+                                    let (row_response, toggled) = draw_directory_row(
                                         ui,
                                         node,
                                         index,
@@ -700,7 +700,12 @@ impl eframe::App for DiskApp {
                                         self.selected == index,
                                         self.expanded.contains(&index),
                                     );
-                                    if clicked {
+                                    if scroll_row
+                                        .is_some_and(|selected_row| rows[selected_row].0 == index)
+                                    {
+                                        row_response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    if row_response.clicked() {
                                         self.selected = index;
                                     }
                                     if toggled && !self.expanded.remove(&index) {
@@ -934,7 +939,7 @@ fn draw_directory_row(
     total_size: u64,
     selected: bool,
     expanded: bool,
-) -> (bool, bool) {
+) -> (egui::Response, bool) {
     let width = ui.available_width().max(TREE_CONTENT_WIDTH);
     let (row, response) = ui.allocate_exact_size(Vec2::new(width, TREE_ROW_HEIGHT), Sense::click());
     let painter = ui.painter();
@@ -1117,7 +1122,7 @@ fn draw_directory_row(
             },
         ),
     );
-    (response.clicked(), toggle)
+    (response, toggle)
 }
 
 fn collect_visible_rows(
