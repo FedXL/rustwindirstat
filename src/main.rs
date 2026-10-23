@@ -313,9 +313,6 @@ impl DiskApp {
                                 self.result = Some(result);
                             }
                             Err(error) => {
-                                self.admin_offer = error.to_ascii_lowercase().contains("access")
-                                    || error.to_ascii_lowercase().contains("folder")
-                                    || error.to_ascii_lowercase().contains("папк");
                                 self.status = error.clone();
                                 self.error = Some(error);
                             }

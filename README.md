@@ -4,6 +4,13 @@ Chat GPT please rewrite slow WINDIRSTAT to RUST 🦀
 
 Fast Windows disk usage analyzer written in Rust.
 
+## Release 1.01
+
+[Download Windirstat RS 1.01 for Windows](dist/windirstat-rs-1.01.exe)
+
+- Detects drive roots using Windows path components and identifies MFT permission failures by error type.
+- Improves parallel directory-tree construction and treemap rendering responsiveness.
+
 ## Release 1.00
 
 [Download Windirstat RS 1.00 for Windows](dist/windirstat-rs-1.00.exe)

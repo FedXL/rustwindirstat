@@ -20,6 +20,30 @@ struct ScanEntry {
     attributes: u32,
 }
 
+#[cfg(windows)]
+struct MftScanError {
+    reason: String,
+    elevation_required: bool,
+}
+
+#[cfg(windows)]
+impl MftScanError {
+    fn from_ntfs(error: ntfs_reader::NtfsReaderError) -> Self {
+        let elevation_required = matches!(error, ntfs_reader::NtfsReaderError::AccessDenied);
+        Self {
+            reason: error.to_string(),
+            elevation_required,
+        }
+    }
+
+    fn other(reason: String) -> Self {
+        Self {
+            reason,
+            elevation_required: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
     NtfsMft,
@@ -79,8 +103,8 @@ fn scan(root: &Path, tx: &Sender<ScanEvent>, cancel: &AtomicBool) -> Result<Scan
             Ok(result) => return Ok(result),
             Err(error) => {
                 let _ = tx.send(ScanEvent::MftFallback {
-                    elevation_required: is_access_denied(&error),
-                    reason: error,
+                    elevation_required: error.elevation_required,
+                    reason: error.reason,
                 });
             }
         }
@@ -256,6 +280,28 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use walkdir::WalkDir;
 
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_detection_uses_path_components() {
+        assert!(super::is_drive_root(Path::new(r"C:\")));
+        assert!(super::is_drive_root(Path::new("C:/")));
+        assert!(!super::is_drive_root(Path::new(r"C:")));
+        assert!(!super::is_drive_root(Path::new(r"C:\Windows")));
+        assert!(!super::is_drive_root(Path::new(r"\\server\share\")));
+        assert_eq!(super::drive_letter(Path::new(r"C:\")), Some('C'));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mft_elevation_flag_uses_the_ntfs_error_variant() {
+        let denied = super::MftScanError::from_ntfs(ntfs_reader::NtfsReaderError::AccessDenied);
+        assert!(denied.elevation_required);
+
+        let invalid =
+            super::MftScanError::from_ntfs(ntfs_reader::NtfsReaderError::InvalidVolumePath);
+        assert!(!invalid.elevation_required);
+    }
+
     #[test]
     fn paths_under_the_same_top_level_directory_share_a_shard() {
         let root = Path::new(r"C:\");
@@ -419,15 +465,16 @@ fn scan_mft(
     root: &Path,
     tx: &Sender<ScanEvent>,
     cancel: &AtomicBool,
-) -> Result<ScanResult, String> {
+) -> Result<ScanResult, MftScanError> {
     use ntfs_reader::{DefaultPathCache, FileInfo, MftScan, Volume};
 
     let started = Instant::now();
-    let drive = root
-        .to_string_lossy()
-        .chars()
-        .next()
-        .ok_or_else(|| "Не удалось определить букву диска".to_owned())?;
+    let drive = drive_letter(root).ok_or_else(|| {
+        MftScanError::other(format!(
+            "Не удалось определить букву диска в пути: {}",
+            root.display()
+        ))
+    })?;
     let volume_path = format!(r"\\.\{}:", drive);
     let _ = tx.send(ScanEvent::Progress {
         files: 0,
@@ -435,11 +482,11 @@ fn scan_mft(
         bytes: 0,
         phase: "Подготавливаю чтение MFT; требуются права администратора".to_owned(),
     });
-    let volume = Volume::new(volume_path.as_str()).map_err(|error| error.to_string())?;
-    let mut scan = MftScan::new(volume).map_err(|error| error.to_string())?;
+    let volume = Volume::new(volume_path.as_str()).map_err(MftScanError::from_ntfs)?;
+    let mut scan = MftScan::new(volume).map_err(MftScanError::from_ntfs)?;
     let total = Some(scan.record_count());
     let mut cache = DefaultPathCache::new();
-    let pool = build_pool().map_err(|error| error.to_string())?;
+    let pool = build_pool().map_err(|error| MftScanError::other(error.to_string()))?;
     let worker_count = pool.current_num_threads();
     let mut trees: Vec<_> = (0..worker_count)
         .map(|_| TreeBuilder::new(root.to_path_buf()))
@@ -448,9 +495,9 @@ fn scan_mft(
     let mut bytes = 0_u64;
     let mut last_report = Instant::now();
 
-    while let Some(chunk) = scan.next_chunk().map_err(|error| error.to_string())? {
+    while let Some(chunk) = scan.next_chunk().map_err(MftScanError::from_ntfs)? {
         if cancel.load(Ordering::Relaxed) {
-            return Err("Сканирование остановлено".to_owned());
+            return Err(MftScanError::other("Сканирование остановлено".to_owned()));
         }
         let mut shards: Vec<Vec<ScanEntry>> = (0..worker_count).map(|_| Vec::new()).collect();
         for file in chunk.files() {
@@ -541,17 +588,22 @@ fn file_attributes(metadata: &std::fs::Metadata) -> u32 {
 
 #[cfg(windows)]
 fn is_drive_root(path: &Path) -> bool {
-    let value = path.to_string_lossy();
-    let bytes = value.as_bytes();
-    bytes.len() == 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
+    let mut components = path.components();
+    matches!(components.next(), Some(std::path::Component::Prefix(prefix))
+        if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
+        && matches!(components.next(), Some(std::path::Component::RootDir))
+        && components.next().is_none()
 }
 
 #[cfg(windows)]
-fn is_access_denied(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("access is denied")
-        || lower.contains("access denied")
-        || lower.contains("os error 5")
+fn drive_letter(path: &Path) -> Option<char> {
+    match path.components().next()? {
+        std::path::Component::Prefix(prefix) => match prefix.kind() {
+            std::path::Prefix::Disk(letter) => Some(char::from(letter)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
