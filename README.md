@@ -1,8 +1,17 @@
-# Windirstat RS 🦀
+# Windirstat RS
 
-Chat GPT please rewrite slow WINDIRSTAT to RUST 🦀
+Chat GPT please rewrite slow WINDIRSTAT to RUST
 
 Fast Windows disk usage analyzer written in Rust.
+
+## Release 1.1.0
+
+[Download Windirstat RS 1.1.0 for Windows](dist/windirstat-rs-1.1.0.exe)
+
+- Rebuilds the NTFS MFT scan around compact file references, reducing the node footprint from 144 to 80 bytes.
+- Scanned a 2.62 million node drive snapshot in about 8.4 seconds in the measured run, roughly 2.34x faster than the path-building backend.
+- Reduced measured peak process memory from about 1.30 GB to 616 MB.
+- Keeps search, directory views, and treemap work responsive during large scans.
 
 ## Release 1.01
 

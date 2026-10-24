@@ -1,4 +1,4 @@
-use crate::model::Node;
+use crate::model::{Node, Snapshot};
 use crate::parallel::{build_pool, worker_count};
 use eframe::egui::{Color32, ColorImage};
 use rayon::prelude::*;
@@ -17,11 +17,37 @@ const MEMORY_RESERVE: usize = 16 * 1024 * 1024;
 const CPU_WINDOW: Duration = Duration::from_millis(100);
 const CPU_BUDGET: Duration = Duration::from_millis(70);
 const CHECK_EVERY: usize = 256;
-pub const PHASE_PREPARE: u8 = 1;
-pub const PHASE_LAYOUT: u8 = 2;
-pub const PHASE_RASTER: u8 = 3;
-pub const PHASE_DONE: u8 = 4;
-pub const PHASE_LIMIT: u8 = 5;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RenderPhase {
+    #[default]
+    Preparing = 0,
+    Layout = 1,
+    Raster = 2,
+    Done = 3,
+    Limited = 4,
+}
+
+#[derive(Debug)]
+pub enum RenderError {
+    Cancelled,
+    MemoryLimit,
+    InvalidDimensions,
+    WorkerPool(String),
+    WorkerPanicked,
+}
+
+impl std::fmt::Display for RenderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("Rendering cancelled"),
+            Self::MemoryLimit => f.write_str("Treemap memory budget exceeded"),
+            Self::InvalidDimensions => f.write_str("Invalid treemap dimensions"),
+            Self::WorkerPool(message) => write!(f, "Cannot start rendering workers: {message}"),
+            Self::WorkerPanicked => f.write_str("Treemap worker failed"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct PackedRect {
@@ -46,9 +72,15 @@ pub struct RenderProgress {
 }
 
 impl RenderProgress {
-    pub fn snapshot(&self) -> (u8, usize, usize) {
+    pub fn snapshot(&self) -> (RenderPhase, usize, usize) {
         (
-            self.phase.load(Ordering::Relaxed),
+            match self.phase.load(Ordering::Relaxed) {
+                1 => RenderPhase::Layout,
+                2 => RenderPhase::Raster,
+                3 => RenderPhase::Done,
+                4 => RenderPhase::Limited,
+                _ => RenderPhase::Preparing,
+            },
             self.done.load(Ordering::Relaxed),
             self.total.load(Ordering::Relaxed),
         )
@@ -95,8 +127,8 @@ impl CpuPacer {
     fn checkpoint(&mut self, generation: &AtomicU64, expected: u64, force: bool) -> bool {
         if !force {
             self.operations += 1;
-            if self.operations % CHECK_EVERY != 0 {
-                return generation.load(Ordering::Relaxed) == expected;
+            if !self.operations.is_multiple_of(CHECK_EVERY) {
+                return true;
             }
         }
         if generation.load(Ordering::Relaxed) != expected {
@@ -106,11 +138,15 @@ impl CpuPacer {
         self.active += now.duration_since(self.last);
         self.last = now;
         if self.active >= CPU_BUDGET {
-            while self.window.elapsed() < CPU_WINDOW {
+            loop {
+                let remaining = CPU_WINDOW.saturating_sub(self.window.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
                 if generation.load(Ordering::Relaxed) != expected {
                     return false;
                 }
-                thread::sleep(Duration::from_millis(2).min(CPU_WINDOW - self.window.elapsed()));
+                thread::sleep(Duration::from_millis(2).min(remaining));
             }
             self.window = Instant::now();
             self.last = self.window;
@@ -124,71 +160,69 @@ impl CpuPacer {
 }
 
 pub fn render(
-    nodes: Arc<Vec<Node>>,
+    nodes: Arc<Snapshot>,
     requested_width: usize,
     requested_height: usize,
     generation: Arc<AtomicU64>,
     expected: u64,
     progress: Arc<RenderProgress>,
-) -> Option<RenderedMap> {
-    if requested_width == 0 || requested_height == 0 {
-        return None;
+) -> Result<RenderedMap, RenderError> {
+    if requested_width == 0 || requested_height == 0 || nodes.is_empty() {
+        return Err(RenderError::InvalidDimensions);
+    }
+    if generation.load(Ordering::Relaxed) != expected {
+        return Err(RenderError::Cancelled);
     }
     let started = Instant::now();
     let node_count = nodes.len();
     let fixed_bytes = node_count
-        .checked_mul(size_of::<u32>() + size_of::<PackedRect>() + size_of::<PaintTile>())?;
-    if fixed_bytes + MEMORY_RESERVE >= MEMORY_LIMIT {
-        progress.phase.store(PHASE_LIMIT, Ordering::Relaxed);
-        return None;
+        .checked_mul(size_of::<PackedRect>() + size_of::<PaintTile>())
+        .ok_or(RenderError::MemoryLimit)?;
+    if fixed_bytes.saturating_add(MEMORY_RESERVE) >= MEMORY_LIMIT {
+        progress
+            .phase
+            .store(RenderPhase::Limited as u8, Ordering::Relaxed);
+        return Err(RenderError::MemoryLimit);
     }
-    let desired_pixels = requested_width.checked_mul(requested_height)?;
+    requested_width
+        .checked_mul(requested_height)
+        .ok_or(RenderError::InvalidDimensions)?;
+    let requested_width = requested_width.min(u16::MAX as usize);
+    let requested_height = requested_height.min(u16::MAX as usize);
+    let desired_pixels = requested_width * requested_height;
     let max_pixels = (MEMORY_LIMIT - fixed_bytes - MEMORY_RESERVE) / 9;
+    if max_pixels == 0 {
+        return Err(RenderError::MemoryLimit);
+    }
     let pixels = desired_pixels.min(max_pixels).max(1);
     let scale = (pixels as f64 / desired_pixels as f64).sqrt().min(1.0);
-    let width = ((requested_width as f64 * scale).round() as usize).max(1);
-    let height = ((requested_height as f64 * scale).round() as usize).max(1);
-    let pixel_count = width.checked_mul(height)?;
+    let width = ((requested_width as f64 * scale).floor() as usize).clamp(1, max_pixels);
+    let height = ((requested_height as f64 * scale).floor() as usize).clamp(1, max_pixels / width);
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or(RenderError::InvalidDimensions)?;
     let used = fixed_bytes + pixel_count * 9 + MEMORY_RESERVE;
     let job_capacity = (MEMORY_LIMIT.saturating_sub(used) / size_of::<Job>()).min(65_536);
 
-    let mut pixels = vec![Color32::from_rgb(250, 250, 250); pixel_count];
-    let mut hits = vec![u32::MAX; pixel_count];
-    let mut hit_weights = vec![0u8; pixel_count];
-    let mut representatives: Vec<u32> = (0..node_count)
-        .map(|i| i.min(u32::MAX as usize) as u32)
-        .collect();
-    let mut rects = vec![PackedRect::default(); node_count];
-    let mut paint_tiles = Vec::with_capacity(node_count);
+    let mut pixels = filled_buffer(pixel_count, Color32::from_rgb(250, 250, 250))?;
+    let mut hits = filled_buffer(pixel_count, u32::MAX)?;
+    let mut hit_weights = filled_buffer(pixel_count, 0u8)?;
+    let mut rects = filled_buffer(node_count, PackedRect::default())?;
+    let mut paint_tiles = Vec::new();
+    paint_tiles
+        .try_reserve_exact(node_count)
+        .map_err(|_| RenderError::MemoryLimit)?;
     let mut colors: HashMap<u32, Color32> = HashMap::new();
     let mut pacer = CpuPacer::new();
-    progress.phase.store(PHASE_PREPARE, Ordering::Relaxed);
+    progress
+        .phase
+        .store(RenderPhase::Preparing as u8, Ordering::Relaxed);
     progress.total.store(node_count, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
 
-    for i in (0..node_count).rev() {
-        let mut best = i;
-        for &child in &nodes[i].children {
-            if nodes[child].size > nodes[best].size {
-                best = child;
-            }
-            if !pacer.checkpoint(&generation, expected, false) {
-                return None;
-            }
-        }
-        representatives[i] = best as u32;
-        if i % CHECK_EVERY == 0 && !pacer.checkpoint(&generation, expected, false) {
-            return None;
-        }
-        if i % 4096 == 0 || i == 0 {
-            progress.done.store(node_count - i, Ordering::Relaxed);
-        }
-    }
-    if !pacer.checkpoint(&generation, expected, true) {
-        return None;
-    }
-
-    progress.phase.store(PHASE_LAYOUT, Ordering::Relaxed);
+    progress
+        .phase
+        .store(RenderPhase::Layout as u8, Ordering::Relaxed);
     progress
         .total
         .store(node_count.saturating_sub(1).max(1), Ordering::Relaxed);
@@ -212,7 +246,7 @@ pub fn render(
         };
         let parent = job.parent as usize;
         if job.bounds.w * job.bounds.h < 1.0 {
-            let leaf = representatives[parent] as usize;
+            let leaf = parent;
             rects[leaf] = pack_rect(job.bounds, width, height);
             let color = color_for(&nodes[leaf], &mut colors);
             paint_tiles.push(PaintTile {
@@ -233,7 +267,7 @@ pub fn render(
         for &i in children {
             total = total.saturating_add(nodes[i].size as u128);
             if !pacer.checkpoint(&generation, expected, false) {
-                return None;
+                return Err(RenderError::Cancelled);
             }
         }
         if total == 0 {
@@ -260,7 +294,7 @@ pub fn render(
                 rects[index] = pack_rect(r, width, height);
                 represented = represented.saturating_add(1);
                 if r.w * r.h < 1.0 || jobs.len() == job_capacity {
-                    let leaf = representatives[index] as usize;
+                    let leaf = index;
                     rects[leaf] = pack_rect(r, width, height);
                     let color = color_for(&nodes[leaf], &mut colors);
                     paint_tiles.push(PaintTile {
@@ -291,7 +325,7 @@ pub fn render(
             }
         });
         if callback_error || generation.load(Ordering::Relaxed) != expected {
-            return None;
+            return Err(RenderError::Cancelled);
         }
         progress.done.store(
             represented.min(progress.total.load(Ordering::Relaxed)),
@@ -300,17 +334,19 @@ pub fn render(
         current = jobs.pop();
     }
     if generation.load(Ordering::Relaxed) != expected {
-        return None;
+        return Err(RenderError::Cancelled);
     }
 
-    progress.phase.store(PHASE_RASTER, Ordering::Relaxed);
+    progress
+        .phase
+        .store(RenderPhase::Raster as u8, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
     progress.total.store(height, Ordering::Relaxed);
     let mut row_counts = vec![0usize; height];
     let mut row_references = 0usize;
     for (tile_index, tile) in paint_tiles.iter().enumerate() {
         if tile_index % CHECK_EVERY == 0 && generation.load(Ordering::Relaxed) != expected {
-            return None;
+            return Err(RenderError::Cancelled);
         }
         for y in tile_rows(tile.bounds, height) {
             row_counts[y] = row_counts[y].saturating_add(1);
@@ -329,59 +365,78 @@ pub fn render(
         let mut rows: Vec<Vec<usize>> = row_counts.into_iter().map(Vec::with_capacity).collect();
         for (tile_index, tile) in paint_tiles.iter().enumerate() {
             if tile_index % CHECK_EVERY == 0 && generation.load(Ordering::Relaxed) != expected {
-                return None;
+                return Err(RenderError::Cancelled);
             }
             for y in tile_rows(tile.bounds, height) {
                 rows[y].push(tile_index);
             }
         }
-        let pool = build_pool().ok()?;
+        let pool = build_pool().map_err(RenderError::WorkerPool)?;
         if !raster_rows_parallel(
-            &mut pixels,
-            &mut hits,
-            &mut hit_weights,
-            width,
+            RasterTarget {
+                pixels: &mut pixels,
+                hits: &mut hits,
+                weights: &mut hit_weights,
+                width,
+                height,
+            },
             &rows,
             &paint_tiles,
-            &generation,
-            expected,
+            RasterControl {
+                generation: &generation,
+                expected,
+            },
             &progress,
-            &pool,
+            pool,
         ) {
-            return None;
+            return Err(RenderError::Cancelled);
         }
     } else {
         progress.total.store(paint_tiles.len(), Ordering::Relaxed);
         for (done, tile) in paint_tiles.iter().enumerate() {
             raster_tile(
-                &mut pixels,
-                &mut hits,
-                &mut hit_weights,
-                width,
-                height,
-                tile.index as usize,
-                tile.bounds,
-                tile.color,
+                &mut RasterTarget {
+                    pixels: &mut pixels,
+                    hits: &mut hits,
+                    weights: &mut hit_weights,
+                    width,
+                    height,
+                },
+                *tile,
                 &mut pacer,
-                &generation,
-                expected,
-            )?;
+                RasterControl {
+                    generation: &generation,
+                    expected,
+                },
+            )
+            .ok_or(RenderError::Cancelled)?;
             progress.done.store(done + 1, Ordering::Relaxed);
         }
     }
     if generation.load(Ordering::Relaxed) != expected {
-        return None;
+        return Err(RenderError::Cancelled);
     }
-    progress.phase.store(PHASE_DONE, Ordering::Relaxed);
+    progress
+        .phase
+        .store(RenderPhase::Done as u8, Ordering::Relaxed);
     progress
         .done
         .store(progress.total.load(Ordering::Relaxed), Ordering::Relaxed);
-    Some(RenderedMap {
+    Ok(RenderedMap {
         image: ColorImage::new([width, height], pixels),
         hits,
         rects,
         elapsed: started.elapsed(),
     })
+}
+
+fn filled_buffer<T: Clone>(length: usize, value: T) -> Result<Vec<T>, RenderError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| RenderError::MemoryLimit)?;
+    buffer.resize(length, value);
+    Ok(buffer)
 }
 
 fn pack_rect(r: R, width: usize, height: usize) -> PackedRect {
@@ -403,23 +458,34 @@ fn tile_rows(bounds: R, height: usize) -> Range<usize> {
     y0.min(height)..y1.min(height)
 }
 
-fn raster_rows_parallel(
-    pixels: &mut [Color32],
-    hits: &mut [u32],
-    weights: &mut [u8],
+struct RasterTarget<'a> {
+    pixels: &'a mut [Color32],
+    hits: &'a mut [u32],
+    weights: &'a mut [u8],
     width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RasterControl<'a> {
+    generation: &'a AtomicU64,
+    expected: u64,
+}
+
+fn raster_rows_parallel(
+    target: RasterTarget<'_>,
     rows: &[Vec<usize>],
     tiles: &[PaintTile],
-    generation: &AtomicU64,
-    expected: u64,
+    control: RasterControl<'_>,
     progress: &RenderProgress,
     pool: &rayon::ThreadPool,
 ) -> bool {
     pool.install(|| {
-        pixels
-            .par_chunks_mut(width)
-            .zip(hits.par_chunks_mut(width))
-            .zip(weights.par_chunks_mut(width))
+        target
+            .pixels
+            .par_chunks_mut(target.width)
+            .zip(target.hits.par_chunks_mut(target.width))
+            .zip(target.weights.par_chunks_mut(target.width))
             .enumerate()
             .try_for_each(|(y, ((pixel_row, hit_row), weight_row))| {
                 for &tile_index in &rows[y] {
@@ -429,8 +495,7 @@ fn raster_rows_parallel(
                         weight_row,
                         y,
                         tiles[tile_index],
-                        generation,
-                        expected,
+                        control,
                     ) {
                         return Err(());
                     }
@@ -448,8 +513,7 @@ fn raster_tile_row(
     weights: &mut [u8],
     y: usize,
     tile: PaintTile,
-    generation: &AtomicU64,
-    expected: u64,
+    control: RasterControl<'_>,
 ) -> bool {
     let r = tile.bounds;
     let width = pixels.len();
@@ -460,12 +524,12 @@ fn raster_tile_row(
     if vertical_coverage <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
         return true;
     }
-    let mut operations = 0usize;
-    for x in x0..x1 {
-        if operations % CHECK_EVERY == 0 && generation.load(Ordering::Relaxed) != expected {
+    for (operations, x) in (x0..x1).enumerate() {
+        if operations.is_multiple_of(CHECK_EVERY)
+            && control.generation.load(Ordering::Relaxed) != control.expected
+        {
             return false;
         }
-        operations += 1;
         let horizontal_coverage = ((r.x + r.w).min((x + 1) as f64) - r.x.max(x as f64)).max(0.0);
         let coverage = horizontal_coverage * vertical_coverage;
         if coverage <= 0.0 {
@@ -537,7 +601,7 @@ fn squarify<F: FnMut(usize, R)>(
             let ns = sum + weight;
             let nmin = min.min(weight);
             let nmax = max.max(weight);
-            let score = worst(nmin, nmax, ns, side, area_total);
+            let score = worst(nmin, nmax, ns, side, area_total / remaining);
             if pos > start && score > best {
                 break;
             }
@@ -552,24 +616,6 @@ fn squarify<F: FnMut(usize, R)>(
         }
         let fraction = (sum / remaining).clamp(0.0, 1.0);
         if area.w >= area.h {
-            let strip_h = (area.h * fraction).min(area.h);
-            let mut x = area.x;
-            for &i in &children[start..pos] {
-                let w = area.w * (nodes[i].size as f64 / sum);
-                emit(
-                    i,
-                    R {
-                        x,
-                        y: area.y,
-                        w,
-                        h: strip_h,
-                    },
-                );
-                x += w;
-            }
-            area.y += strip_h;
-            area.h -= strip_h;
-        } else {
             let strip_w = (area.w * fraction).min(area.w);
             let mut y = area.y;
             for &i in &children[start..pos] {
@@ -587,6 +633,24 @@ fn squarify<F: FnMut(usize, R)>(
             }
             area.x += strip_w;
             area.w -= strip_w;
+        } else {
+            let strip_h = (area.h * fraction).min(area.h);
+            let mut x = area.x;
+            for &i in &children[start..pos] {
+                let w = area.w * (nodes[i].size as f64 / sum);
+                emit(
+                    i,
+                    R {
+                        x,
+                        y: area.y,
+                        w,
+                        h: strip_h,
+                    },
+                );
+                x += w;
+            }
+            area.y += strip_h;
+            area.h -= strip_h;
         }
         remaining = (remaining - sum).max(0.0);
     }
@@ -596,83 +660,43 @@ fn squarify<F: FnMut(usize, R)>(
         pos += 1;
     }
 }
-fn worst(min: f64, max: f64, sum: f64, side: f64, area: f64) -> f64 {
-    if min <= 0.0 || sum <= 0.0 || area <= 0.0 {
-        f64::INFINITY
-    } else {
-        (side * side * sum / (area * min)).max(area * max / (sum * side * side))
+fn worst(min: f64, max: f64, sum: f64, side: f64, scale: f64) -> f64 {
+    if min <= 0.0 || sum <= 0.0 || side <= 0.0 || scale <= 0.0 {
+        return f64::INFINITY;
     }
+    let sum_area = sum * scale;
+    let sum_squared = sum_area * sum_area;
+    (side * side * max * scale / sum_squared).max(sum_squared / (side * side * min * scale))
 }
 
 fn raster_tile(
-    pixels: &mut [Color32],
-    hits: &mut [u32],
-    weights: &mut [u8],
-    width: usize,
-    height: usize,
-    index: usize,
-    r: R,
-    base: Color32,
+    target: &mut RasterTarget<'_>,
+    tile: PaintTile,
     pacer: &mut CpuPacer,
-    generation: &AtomicU64,
-    expected: u64,
+    control: RasterControl<'_>,
 ) -> Option<()> {
-    if r.w <= 0.0 || r.h <= 0.0 {
-        return Some(());
-    }
-    let x0 = r.x.floor().max(0.0) as usize;
-    let y0 = r.y.floor().max(0.0) as usize;
-    let x1 = (r.x + r.w).ceil().min(width as f64) as usize;
-    let y1 = (r.y + r.h).ceil().min(height as f64) as usize;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if !pacer.checkpoint(generation, expected, false) {
-                return None;
-            }
-            let coverage = ((r.x + r.w).min((x + 1) as f64) - r.x.max(x as f64)).max(0.0)
-                * ((r.y + r.h).min((y + 1) as f64) - r.y.max(y as f64)).max(0.0);
-            if coverage <= 0.0 {
-                continue;
-            }
-            let u = ((x as f64 + 0.5 - r.x) / r.w).clamp(0.0, 1.0);
-            let v = ((y as f64 + 0.5 - r.y) / r.h).clamp(0.0, 1.0);
-            let cushion = 0.68
-                + 0.72
-                    * (1.0 - ((u - 0.5).abs() * 2.0).powi(2))
-                    * (1.0 - ((v - 0.5).abs() * 2.0).powi(2));
-            let edge =
-                if r.w > 2.0 && r.h > 2.0 && (u < 0.008 || v < 0.008 || u > 0.992 || v > 0.992) {
-                    0.78
-                } else {
-                    1.0
-                };
-            let f = cushion * edge;
-            let src = [
-                (base.r() as f64 * f).min(255.0),
-                (base.g() as f64 * f).min(255.0),
-                (base.b() as f64 * f).min(255.0),
-            ];
-            let at = y * width + x;
-            let old = pixels[at];
-            let a = coverage.min(1.0);
-            pixels[at] = Color32::from_rgb(
-                (old.r() as f64 * (1.0 - a) + src[0] * a).round() as u8,
-                (old.g() as f64 * (1.0 - a) + src[1] * a).round() as u8,
-                (old.b() as f64 * (1.0 - a) + src[2] * a).round() as u8,
-            );
-            let weight = (coverage * 255.0).round().clamp(1.0, 255.0) as u8;
-            if weight >= weights[at] {
-                weights[at] = weight;
-                hits[at] = index.min(u32::MAX as usize) as u32;
-            }
+    for y in tile_rows(tile.bounds, target.height) {
+        if !pacer.checkpoint(control.generation, control.expected, false) {
+            return None;
+        }
+        let start = y * target.width;
+        let end = start + target.width;
+        if !raster_tile_row(
+            &mut target.pixels[start..end],
+            &mut target.hits[start..end],
+            &mut target.weights[start..end],
+            y,
+            tile,
+            control,
+        ) {
+            return None;
         }
     }
     Some(())
 }
 
 fn color_for(node: &Node, cache: &mut HashMap<u32, Color32>) -> Color32 {
-    let hash = node
-        .path
+    let hash = std::path::Path::new(node.name.as_ref())
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -715,8 +739,110 @@ fn extension_color(hash: u32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Node;
     use std::time::Instant;
+
+    fn fixture(sizes: &[u64]) -> Snapshot {
+        let root = std::path::PathBuf::from("root");
+        let mut builder = crate::model::TreeBuilder::new(root.clone());
+        for (index, &size) in sizes.iter().enumerate() {
+            builder.add(root.join(format!("{index}.bin")), false, size, None, 0);
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn equal_files_produce_square_tiles() {
+        let nodes = fixture(&[1, 1, 1, 1]);
+        let mut tiles = Vec::new();
+        squarify(
+            &nodes,
+            &nodes[0].children,
+            R {
+                w: 100.0,
+                h: 100.0,
+                ..R::default()
+            },
+            4.0,
+            |_, rect| tiles.push(rect),
+        );
+        assert_eq!(tiles.len(), 4);
+        assert!(
+            tiles
+                .iter()
+                .all(|rect| (rect.w - 50.0).abs() < 1e-8 && (rect.h - 50.0).abs() < 1e-8)
+        );
+    }
+
+    #[test]
+    fn layout_preserves_area_and_does_not_overlap_on_skewed_and_tall_inputs() {
+        for sizes in [vec![90, 5, 3, 2, 0], vec![1; 100], vec![0, 0]] {
+            let nodes = fixture(&sizes);
+            let total: u64 = sizes.iter().sum();
+            for (w, h) in [(100.0, 100.0), (9.0, 1000.0), (1000.0, 9.0)] {
+                let bounds = R {
+                    x: 10.0,
+                    y: 20.0,
+                    w,
+                    h,
+                };
+                let mut tiles = Vec::new();
+                squarify(
+                    &nodes,
+                    &nodes[0].children,
+                    bounds,
+                    total as f64,
+                    |index, rect| {
+                        if rect.w * rect.h > 0.0 {
+                            assert!(rect.x >= bounds.x - 1e-8 && rect.y >= bounds.y - 1e-8);
+                            assert!(rect.x + rect.w <= bounds.x + w + 1e-8);
+                            assert!(rect.y + rect.h <= bounds.y + h + 1e-8);
+                            let expected = w * h * nodes[index].size as f64 / total as f64;
+                            assert!((rect.w * rect.h - expected).abs() < 1e-6);
+                            tiles.push(rect);
+                        }
+                    },
+                );
+                for (index, a) in tiles.iter().enumerate() {
+                    for b in &tiles[index + 1..] {
+                        let overlap_w = ((a.x + a.w).min(b.x + b.w) - a.x.max(b.x)).max(0.0);
+                        let overlap_h = ((a.y + a.h).min(b.y + b.h) - a.y.max(b.y)).max(0.0);
+                        assert!(overlap_w * overlap_h < 1e-6);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_reports_cancellation_and_invalid_dimensions() {
+        let nodes = Arc::new(fixture(&[1]));
+        assert!(matches!(
+            render(
+                Arc::clone(&nodes),
+                10,
+                10,
+                Arc::new(AtomicU64::new(1)),
+                0,
+                Arc::new(RenderProgress::default())
+            ),
+            Err(RenderError::Cancelled)
+        ));
+        assert!(matches!(
+            render(
+                nodes,
+                usize::MAX,
+                2,
+                Arc::new(AtomicU64::new(0)),
+                0,
+                Arc::new(RenderProgress::default())
+            ),
+            Err(RenderError::InvalidDimensions)
+        ));
+        let mut pacer = CpuPacer::new();
+        pacer.window = Instant::now() - Duration::from_secs(1);
+        pacer.active = CPU_BUDGET;
+        assert!(pacer.checkpoint(&AtomicU64::new(0), 0, true));
+    }
 
     #[test]
     fn parallel_rows_match_serial_pixels_and_hit_testing() {
@@ -760,19 +886,21 @@ mod tests {
         let mut serial_weights = vec![0u8; width * height];
         let generation = AtomicU64::new(7);
         let mut pacer = CpuPacer::new();
-        for tile in tiles {
+        for tile in &tiles {
             raster_tile(
-                &mut serial_pixels,
-                &mut serial_hits,
-                &mut serial_weights,
-                width,
-                height,
-                tile.index as usize,
-                tile.bounds,
-                tile.color,
+                &mut RasterTarget {
+                    pixels: &mut serial_pixels,
+                    hits: &mut serial_hits,
+                    weights: &mut serial_weights,
+                    width,
+                    height,
+                },
+                *tile,
                 &mut pacer,
-                &generation,
-                7,
+                RasterControl {
+                    generation: &generation,
+                    expected: 7,
+                },
             )
             .unwrap();
         }
@@ -787,69 +915,38 @@ mod tests {
         let mut parallel_hits = vec![u32::MAX; width * height];
         let mut parallel_weights = vec![0u8; width * height];
         let progress = RenderProgress::default();
-        progress.phase.store(PHASE_RASTER, Ordering::Relaxed);
+        progress
+            .phase
+            .store(RenderPhase::Raster as u8, Ordering::Relaxed);
         progress.total.store(height, Ordering::Relaxed);
         let pool = build_pool().unwrap();
         assert!(raster_rows_parallel(
-            &mut parallel_pixels,
-            &mut parallel_hits,
-            &mut parallel_weights,
-            width,
+            RasterTarget {
+                pixels: &mut parallel_pixels,
+                hits: &mut parallel_hits,
+                weights: &mut parallel_weights,
+                width,
+                height
+            },
             &row_tiles,
             &tiles,
-            &generation,
-            7,
+            RasterControl {
+                generation: &generation,
+                expected: 7
+            },
             &progress,
-            &pool,
+            pool,
         ));
 
         assert_eq!(parallel_pixels, serial_pixels);
         assert_eq!(parallel_hits, serial_hits);
         assert_eq!(parallel_weights, serial_weights);
-        assert_eq!(progress.snapshot(), (PHASE_RASTER, height, height));
+        assert_eq!(progress.snapshot(), (RenderPhase::Raster, height, height));
     }
 
     #[test]
     fn render_pipeline_returns_clickable_tiles() {
-        let root = std::path::PathBuf::from("root");
-        let nodes = Arc::new(vec![
-            Node {
-                name: "root".to_owned(),
-                path: root.clone(),
-                size: 300,
-                is_dir: true,
-                parent: None,
-                children: vec![1, 2],
-                files: 2,
-                folders: 0,
-                modified: None,
-                attributes: 0,
-            },
-            Node {
-                name: "large.bin".to_owned(),
-                path: root.join("large.bin"),
-                size: 200,
-                is_dir: false,
-                parent: Some(0),
-                children: Vec::new(),
-                files: 1,
-                folders: 0,
-                modified: None,
-                attributes: 0,
-            },
-            Node {
-                name: "small.txt".to_owned(),
-                path: root.join("small.txt"),
-                size: 100,
-                is_dir: false,
-                parent: Some(0),
-                children: Vec::new(),
-                files: 1,
-                folders: 0,
-                modified: None,
-                attributes: 0,
-            },
-        ]);
+        let nodes = Arc::new(fixture(&[200, 100]));
         let progress = Arc::new(RenderProgress::default());
         let rendered = render(
             nodes,
@@ -863,7 +960,7 @@ mod tests {
 
         assert_eq!(rendered.image.size, [64, 48]);
         assert!(rendered.hits.iter().all(|&hit| hit == 1 || hit == 2));
-        assert_eq!(progress.snapshot().0, PHASE_DONE);
+        assert_eq!(progress.snapshot().0, RenderPhase::Done);
         assert!(rendered.elapsed > Duration::ZERO);
     }
 
@@ -894,17 +991,19 @@ mod tests {
         let mut pacer = CpuPacer::new();
         for tile in &tiles {
             raster_tile(
-                &mut serial_pixels,
-                &mut serial_hits,
-                &mut serial_weights,
-                width,
-                height,
-                tile.index as usize,
-                tile.bounds,
-                tile.color,
+                &mut RasterTarget {
+                    pixels: &mut serial_pixels,
+                    hits: &mut serial_hits,
+                    weights: &mut serial_weights,
+                    width,
+                    height,
+                },
+                *tile,
                 &mut pacer,
-                &generation,
-                1,
+                RasterControl {
+                    generation: &generation,
+                    expected: 1,
+                },
             )
             .unwrap();
         }
@@ -924,16 +1023,21 @@ mod tests {
         let pool = build_pool().unwrap();
         let started = Instant::now();
         assert!(raster_rows_parallel(
-            &mut parallel_pixels,
-            &mut parallel_hits,
-            &mut parallel_weights,
-            width,
+            RasterTarget {
+                pixels: &mut parallel_pixels,
+                hits: &mut parallel_hits,
+                weights: &mut parallel_weights,
+                width,
+                height
+            },
             &rows,
             &tiles,
-            &generation,
-            1,
+            RasterControl {
+                generation: &generation,
+                expected: 1
+            },
             &progress,
-            &pool,
+            pool,
         ));
         let parallel_elapsed = started.elapsed();
 

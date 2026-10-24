@@ -1018,8 +1018,6 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 [[package]]
 name = "ntfs-reader"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb34a1cf0c0b3156733287e619769b4c82a03a53497594217ab66cc68d483404"
 dependencies = [
  "thiserror 2.0.21",
  "time",
@@ -2075,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "windirstat-rs"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "eframe",
  "ntfs-reader",
