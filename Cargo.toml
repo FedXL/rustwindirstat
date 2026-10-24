@@ -1,6 +1,6 @@
 [package]
 name = "windirstat-rs"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 description = "Fast Windows disk usage analyzer with an NTFS MFT fast path"
 
