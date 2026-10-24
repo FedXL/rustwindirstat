@@ -1,4 +1,4 @@
-use crate::model::Node;
+use crate::model::{Node, Snapshot};
 use crate::parallel::{build_pool, worker_count};
 use eframe::egui::{Color32, ColorImage};
 use rayon::prelude::*;
@@ -160,7 +160,7 @@ impl CpuPacer {
 }
 
 pub fn render(
-    nodes: Arc<Vec<Node>>,
+    nodes: Arc<Snapshot>,
     requested_width: usize,
     requested_height: usize,
     generation: Arc<AtomicU64>,
@@ -696,8 +696,7 @@ fn raster_tile(
 }
 
 fn color_for(node: &Node, cache: &mut HashMap<u32, Color32>) -> Color32 {
-    let hash = node
-        .path
+    let hash = std::path::Path::new(node.name.as_ref())
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -740,10 +739,9 @@ fn extension_color(hash: u32) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Node;
     use std::time::Instant;
 
-    fn fixture(sizes: &[u64]) -> Vec<Node> {
+    fn fixture(sizes: &[u64]) -> Snapshot {
         let root = std::path::PathBuf::from("root");
         let mut builder = crate::model::TreeBuilder::new(root.clone());
         for (index, &size) in sizes.iter().enumerate() {
@@ -948,45 +946,7 @@ mod tests {
 
     #[test]
     fn render_pipeline_returns_clickable_tiles() {
-        let root = std::path::PathBuf::from("root");
-        let nodes = Arc::new(vec![
-            Node {
-                name: "root".to_owned(),
-                path: root.clone(),
-                size: 300,
-                is_dir: true,
-                parent: None,
-                children: vec![1, 2],
-                files: 2,
-                folders: 0,
-                modified: None,
-                attributes: 0,
-            },
-            Node {
-                name: "large.bin".to_owned(),
-                path: root.join("large.bin"),
-                size: 200,
-                is_dir: false,
-                parent: Some(0),
-                children: Vec::new(),
-                files: 1,
-                folders: 0,
-                modified: None,
-                attributes: 0,
-            },
-            Node {
-                name: "small.txt".to_owned(),
-                path: root.join("small.txt"),
-                size: 100,
-                is_dir: false,
-                parent: Some(0),
-                children: Vec::new(),
-                files: 1,
-                folders: 0,
-                modified: None,
-                attributes: 0,
-            },
-        ]);
+        let nodes = Arc::new(fixture(&[200, 100]));
         let progress = Arc::new(RenderProgress::default());
         let rendered = render(
             nodes,

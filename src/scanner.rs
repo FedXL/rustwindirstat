@@ -1,4 +1,4 @@
-use crate::model::{Node, TreeBuilder};
+use crate::model::{Snapshot, TreeBuilder};
 use crate::parallel::build_pool;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -44,6 +44,7 @@ impl std::fmt::Display for ScanError {
 #[cfg(windows)]
 enum MftScanError {
     Cancelled,
+    Fatal(ScanError),
     Failed {
         reason: String,
         elevation_required: bool,
@@ -53,6 +54,9 @@ enum MftScanError {
 #[cfg(windows)]
 impl MftScanError {
     fn from_ntfs(error: ntfs_reader::NtfsReaderError) -> Self {
+        if matches!(error, ntfs_reader::NtfsReaderError::Cancelled) {
+            return Self::Cancelled;
+        }
         Self::Failed {
             elevation_required: matches!(error, ntfs_reader::NtfsReaderError::AccessDenied),
             reason: error.to_string(),
@@ -79,9 +83,20 @@ pub struct ScanTimings {
     enumeration: Duration,
     construction: Duration,
     finalization: Duration,
+    worker_records: Vec<u64>,
 }
 
 impl ScanTimings {
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"preparation\":{:.6},\"enumeration\":{:.6},\"construction\":{:.6},\"finalization\":{:.6},\"worker_records\":{:?}}}",
+            self.preparation.as_secs_f64(),
+            self.enumeration.as_secs_f64(),
+            self.construction.as_secs_f64(),
+            self.finalization.as_secs_f64(),
+            self.worker_records
+        )
+    }
     pub fn describe(&self) -> String {
         format!(
             "Подготовка: {:.3} с\nЧтение и разбор: {:.3} с\nВставка записей: {:.3} с\nИтоги и сортировка: {:.3} с",
@@ -138,7 +153,7 @@ impl ScanMode {
 
 #[derive(Debug)]
 pub struct ScanResult {
-    pub nodes: Arc<Vec<Node>>,
+    pub nodes: Arc<Snapshot>,
     pub mode: ScanMode,
     pub files: u64,
     pub elapsed: Duration,
@@ -205,7 +220,24 @@ pub fn scan_async(root: PathBuf) -> Result<ScanTask, ScanError> {
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum MftBackend {
+    References,
+    Paths,
+}
+
 fn scan(root: &Path, tx: &Sender<ScanEvent>, cancel: &AtomicBool) -> Result<ScanResult, ScanError> {
+    scan_with_backend(root, tx, cancel, MftBackend::References)
+}
+
+pub fn scan_with_backend(
+    root: &Path,
+    tx: &Sender<ScanEvent>,
+    cancel: &AtomicBool,
+    backend: MftBackend,
+) -> Result<ScanResult, ScanError> {
+    let root = crate::paths::normalize(root);
+    let root = root.as_path();
     if cancel.load(Ordering::Relaxed) {
         return Err(ScanError::Cancelled);
     }
@@ -220,9 +252,14 @@ fn scan(root: &Path, tx: &Sender<ScanEvent>, cancel: &AtomicBool) -> Result<Scan
 
     #[cfg(windows)]
     if is_drive_root(root) {
-        match scan_mft(root, tx, cancel) {
+        let result = match backend {
+            MftBackend::References => scan_mft(root, tx, cancel),
+            MftBackend::Paths => scan_mft_paths(root, tx, cancel),
+        };
+        match result {
             Ok(result) => return Ok(result),
             Err(MftScanError::Cancelled) => return Err(ScanError::Cancelled),
+            Err(MftScanError::Fatal(error)) => return Err(error),
             Err(MftScanError::Failed {
                 reason,
                 elevation_required,
@@ -291,7 +328,7 @@ impl WalkBuilder {
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<Node> {
+    fn finish(mut self) -> Snapshot {
         if let Some(mut parallel) = self.parallel {
             insert_records(
                 &mut self.records,
@@ -459,21 +496,15 @@ fn shard_for(path: &Path, root: &Path, shard_count: usize) -> usize {
 }
 
 #[cfg(windows)]
-fn scan_mft(
+fn open_mft(
     root: &Path,
     tx: &Sender<ScanEvent>,
     cancel: &AtomicBool,
-) -> Result<ScanResult, MftScanError> {
-    use ntfs_reader::{DefaultPathCache, FileInfo, MftScan, Volume};
-
-    let started = Instant::now();
+    backend: MftBackend,
+) -> Result<ntfs_reader::MftScan, MftScanError> {
     let drive = drive_letter(root).ok_or_else(|| {
-        MftScanError::other(format!(
-            "Не удалось определить букву диска в пути: {}",
-            root.display()
-        ))
+        MftScanError::other(format!("Не удалось определить диск: {}", root.display()))
     })?;
-    let volume_path = format!(r"\\.\{}:", drive);
     let _ = tx.send(ScanEvent::Progress {
         files: 0,
         processed: 0,
@@ -481,15 +512,59 @@ fn scan_mft(
         bytes: 0,
         phase: ScanPhase::Preparing,
     });
-    let volume = Volume::new(volume_path.as_str()).map_err(MftScanError::from_ntfs)?;
-    if cancel.load(Ordering::Relaxed) {
-        return Err(MftScanError::Cancelled);
+    let volume =
+        ntfs_reader::Volume::new(format!(r"\\.\{drive}:")).map_err(MftScanError::from_ntfs)?;
+    let mut last_report = Instant::now();
+    let mut completed_reported = false;
+    let progress = |done, total: u64| {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if total > 0
+            && (last_report.elapsed() >= Duration::from_millis(120)
+                || (done == total && !completed_reported))
+        {
+            let _ = tx.send(ScanEvent::Progress {
+                files: 0,
+                processed: done,
+                total: Some(total.saturating_mul(2)),
+                bytes: 0,
+                phase: ScanPhase::Preparing,
+            });
+            last_report = Instant::now();
+            completed_reported |= done == total;
+        }
+        true
+    };
+    match backend {
+        MftBackend::References => {
+            ntfs_reader::MftScan::with_live_metadata_controlled(volume, 4096, progress)
+        }
+        MftBackend::Paths => {
+            ntfs_reader::MftScan::with_chunk_records_controlled(volume, 4096, progress)
+        }
     }
-    let mut scan = MftScan::new(volume).map_err(MftScanError::from_ntfs)?;
-    if cancel.load(Ordering::Relaxed) {
-        return Err(MftScanError::Cancelled);
+    .map_err(MftScanError::from_ntfs)
+}
+
+#[cfg(windows)]
+fn scan_mft(
+    root: &Path,
+    tx: &Sender<ScanEvent>,
+    cancel: &AtomicBool,
+) -> Result<ScanResult, MftScanError> {
+    use crate::mft_index::{BuildError, IndexBuilder, MODEL_BUDGET, decode};
+    fn build_error(error: BuildError) -> MftScanError {
+        match error {
+            BuildError::Cancelled => MftScanError::Cancelled,
+            BuildError::MemoryLimit => MftScanError::Fatal(ScanError::Failed(
+                "Недостаточно памяти для индекса. Выберите папку меньшего размера.".to_owned(),
+            )),
+        }
     }
-    let total = Some(scan.record_count());
+    let started = Instant::now();
+    let mut scan = open_mft(root, tx, cancel, MftBackend::References)?;
+    let slots = scan.record_count();
     let mut warnings = ScanWarnings {
         corrupt_records: scan.corrupt_records(),
         ..ScanWarnings::default()
@@ -498,7 +573,155 @@ fn scan_mft(
         preparation: started.elapsed(),
         ..ScanTimings::default()
     };
-    let mut processed = 0;
+    let pool = build_pool().map_err(MftScanError::other)?;
+    let counters: Vec<_> = (0..pool.current_num_threads())
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+    let mut builder: Option<IndexBuilder> = None;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut last_report = Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(MftScanError::Cancelled);
+        }
+        let retained = scan.size_in_memory();
+        if crate::metrics::process_memory().private_bytes > crate::mft_index::MODEL_BUDGET {
+            return Err(MftScanError::Fatal(ScanError::Failed(
+                "Process memory budget exceeded".to_owned(),
+            )));
+        }
+        let reading = Instant::now();
+        let chunk = scan.next_chunk().map_err(MftScanError::from_ntfs)?;
+        timings.enumeration += reading.elapsed();
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let decoding = Instant::now();
+        if builder.is_none() {
+            let root_record = chunk
+                .record(5)
+                .filter(|file| file.is_directory() && file.is_used())
+                .ok_or_else(|| {
+                    MftScanError::other("Отсутствует корневая запись NTFS".to_owned())
+                })?;
+            let mut index = IndexBuilder::new(
+                root.to_path_buf(),
+                root_record.reference(),
+                MODEL_BUDGET.saturating_sub(retained),
+            );
+            // Normal enumeration excludes records 0..23. Some normal files live under
+            // reserved directories such as $Extend; preserve only the ancestors needed.
+            for number in 0..24 {
+                if let Some(file) = chunk.record(number)
+                    && file.is_directory()
+                    && file.is_used()
+                    && let Some(mut record) = decode(&file)
+                {
+                    record.modified = None;
+                    record.attributes = 0;
+                    index.push(record, true).map_err(build_error)?;
+                }
+            }
+            builder = Some(index);
+        }
+        let raw: Vec<_> = chunk.files().collect();
+        let decoded: Vec<_> = pool.install(|| {
+            raw.par_chunks(256)
+                .flat_map_iter(|files| {
+                    if let Some(worker) = rayon::current_thread_index() {
+                        counters[worker].fetch_add(files.len() as u64, Ordering::Relaxed);
+                    }
+                    files.iter().map(|file| {
+                        if cancel.load(Ordering::Relaxed) {
+                            None
+                        } else {
+                            decode(file)
+                        }
+                    })
+                })
+                .collect()
+        });
+        timings.enumeration += decoding.elapsed();
+        if cancel.load(Ordering::Relaxed) {
+            return Err(MftScanError::Cancelled);
+        }
+        let constructing = Instant::now();
+        if let Some(builder) = &mut builder {
+            for record in decoded {
+                if let Some(record) = record {
+                    if !record.is_dir {
+                        files += 1;
+                        bytes = bytes.saturating_add(record.size);
+                    }
+                    builder.push(record, false).map_err(build_error)?;
+                } else {
+                    warnings.record("Запись MFT без имени");
+                }
+            }
+        }
+        timings.construction += constructing.elapsed();
+        if last_report.elapsed() >= Duration::from_millis(120) || chunk.records().end == slots {
+            let _ = tx.send(ScanEvent::Progress {
+                files,
+                processed: slots.saturating_add(chunk.records().end),
+                total: Some(slots.saturating_mul(2)),
+                bytes,
+                phase: ScanPhase::ReadingMft,
+            });
+            last_report = Instant::now();
+        }
+    }
+    timings.worker_records = counters
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .collect();
+    drop(scan);
+    let _ = tx.send(ScanEvent::Progress {
+        files,
+        processed: slots.saturating_mul(2),
+        total: Some(slots.saturating_mul(2)),
+        bytes,
+        phase: ScanPhase::Finalizing,
+    });
+    let finishing = Instant::now();
+    let builder =
+        builder.ok_or_else(|| MftScanError::other("MFT не содержит записей".to_owned()))?;
+    let built = builder.finish(cancel).map_err(build_error)?;
+    timings.finalization = finishing.elapsed();
+    warnings.skipped += built.omitted as u64;
+    let files = built.snapshot[0].files;
+    Ok(ScanResult {
+        nodes: Arc::new(built.snapshot),
+        mode: ScanMode::NtfsMft,
+        files,
+        elapsed: started.elapsed(),
+        warnings,
+        timings,
+    })
+}
+
+#[cfg(windows)]
+fn scan_mft_paths(
+    root: &Path,
+    tx: &Sender<ScanEvent>,
+    cancel: &AtomicBool,
+) -> Result<ScanResult, MftScanError> {
+    use ntfs_reader::{DefaultPathCache, FileInfo};
+
+    let started = Instant::now();
+    let mut scan = open_mft(root, tx, cancel, MftBackend::Paths)?;
+    let slots = scan.record_count();
+    let total = Some(slots.saturating_mul(2));
+    let mut warnings = ScanWarnings {
+        corrupt_records: scan.corrupt_records(),
+        ..ScanWarnings::default()
+    };
+    let mut timings = ScanTimings {
+        preparation: started.elapsed(),
+        ..ScanTimings::default()
+    };
+    let mut processed = slots;
     let mut cache = DefaultPathCache::new();
     let pool = build_pool().map_err(|error| MftScanError::other(error.to_string()))?;
     let worker_count = pool.current_num_threads();
@@ -511,6 +734,11 @@ fn scan_mft(
     let mut last_report = Instant::now();
 
     loop {
+        if crate::metrics::process_memory().private_bytes > crate::mft_index::MODEL_BUDGET * 4 {
+            return Err(MftScanError::Fatal(ScanError::Failed(
+                "Process memory budget exceeded".to_owned(),
+            )));
+        }
         let reading = Instant::now();
         let chunk = scan.next_chunk().map_err(MftScanError::from_ntfs)?;
         timings.enumeration += reading.elapsed();
@@ -559,7 +787,7 @@ fn scan_mft(
                 last_report = Instant::now();
             }
         }
-        processed = chunk.records().end;
+        processed = slots.saturating_add(chunk.records().end);
         timings.enumeration += decoding.elapsed();
         let constructing = Instant::now();
         pool.install(|| {

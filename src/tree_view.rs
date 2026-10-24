@@ -82,7 +82,9 @@ impl TreeView {
             if self.expanded.contains(&index) {
                 let mut children = nodes[index].children.clone();
                 if self.column == SortColumn::Name {
-                    children.sort_by_cached_key(|&child| nodes[child].name.to_lowercase());
+                    children.sort_by_cached_key(|&child| {
+                        nodes[child].name.to_string_lossy().to_lowercase()
+                    });
                     if self.descending {
                         children.reverse();
                     }
@@ -123,7 +125,7 @@ impl TreeView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TreeBuilder;
+    use crate::model::{Snapshot, TreeBuilder};
     use std::path::PathBuf;
 
     #[test]
@@ -138,7 +140,7 @@ mod tests {
         assert_eq!(centered_row_offset(0, viewport, 28.0, 3.0), 0.0);
     }
 
-    fn fixture(count: usize) -> Vec<Node> {
+    fn fixture(count: usize) -> Snapshot {
         let root = PathBuf::from("root");
         let mut builder = TreeBuilder::new(root.clone());
         for index in 0..count {

@@ -1,4 +1,4 @@
-use crate::model::Node;
+use crate::model::Snapshot;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ impl Drop for SearchState {
 }
 
 impl SearchState {
-    pub fn update(&mut self, nodes: Option<&Arc<Vec<Node>>>, revision: u64) -> bool {
+    pub fn update(&mut self, nodes: Option<&Arc<Snapshot>>, revision: u64) -> bool {
         if self.query != self.observed_query || revision != self.revision {
             self.observed_query.clone_from(&self.query);
             self.revision = revision;
@@ -101,17 +101,19 @@ impl SearchState {
 }
 
 fn find_matches(
-    nodes: &[Node],
+    nodes: &Snapshot,
     query: &str,
     generation: &AtomicU64,
     expected: u64,
 ) -> Vec<(usize, usize)> {
     let mut best = BinaryHeap::with_capacity(RESULT_LIMIT + 1);
-    for (index, node) in nodes.iter().enumerate() {
-        if index.is_multiple_of(256) && generation.load(Ordering::Relaxed) != expected {
-            return Vec::new();
+    let mut visited = 0usize;
+    nodes.visit_paths(|index, path| {
+        if visited.is_multiple_of(256) && generation.load(Ordering::Relaxed) != expected {
+            return std::ops::ControlFlow::Break(());
         }
-        let path = node.path.to_string_lossy();
+        visited += 1;
+        let path = path.to_string_lossy();
         let matches = if query.is_ascii() && path.is_ascii() {
             path.as_bytes()
                 .windows(query.len())
@@ -120,11 +122,15 @@ fn find_matches(
             path.to_lowercase().contains(query)
         };
         if matches {
-            best.push(Reverse((node.size, index)));
+            best.push(Reverse((nodes[index].size, index)));
             if best.len() > RESULT_LIMIT {
                 best.pop();
             }
         }
+        std::ops::ControlFlow::Continue(())
+    });
+    if generation.load(Ordering::Relaxed) != expected {
+        return Vec::new();
     }
     let mut best: Vec<_> = best.into_iter().map(|Reverse(value)| value).collect();
     best.sort_unstable_by(|a, b| b.cmp(a));
@@ -137,7 +143,7 @@ mod tests {
     use crate::model::TreeBuilder;
     use std::path::PathBuf;
 
-    fn fixture(count: usize) -> Arc<Vec<Node>> {
+    fn fixture(count: usize) -> Arc<Snapshot> {
         let root = PathBuf::from("root");
         let mut builder = TreeBuilder::new(root.clone());
         for index in 0..count {

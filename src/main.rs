@@ -1,5 +1,8 @@
 mod actions;
+mod benchmark;
 mod map_view;
+mod metrics;
+mod mft_index;
 mod model;
 mod parallel;
 mod paths;
@@ -18,6 +21,16 @@ use std::time::Duration;
 use tree_view::{SortColumn, TreeView};
 
 fn main() -> eframe::Result {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "--benchmark") {
+        std::process::exit(benchmark::run(&arguments[1..]));
+    }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "--benchmark-suite")
+    {
+        std::process::exit(benchmark::suite(&arguments[1..]));
+    }
     let start_path = std::env::args()
         .skip_while(|arg| arg != "--scan")
         .nth(1)
@@ -84,7 +97,12 @@ const TREE_CONTENT_WIDTH: f32 = {
 
 impl DiskApp {
     fn new(cc: &eframe::CreationContext<'_>, root: String) -> Self {
-        cc.egui_ctx.set_theme(egui::ThemePreference::Light);
+        Self::configure(&cc.egui_ctx);
+        Self::with_root(root)
+    }
+
+    fn configure(ctx: &egui::Context) {
+        ctx.set_theme(egui::ThemePreference::Light);
         let mut fonts = egui::FontDefinitions::default();
         if let Some(windows) = std::env::var_os("WINDIR")
             && let Ok(bytes) = std::fs::read(PathBuf::from(windows).join("Fonts/segoeui.ttf"))
@@ -99,8 +117,8 @@ impl DiskApp {
                 .or_default()
                 .insert(0, "segoe_ui".to_owned());
         }
-        cc.egui_ctx.set_fonts(fonts);
-        let mut style = (*cc.egui_ctx.style_of(egui::Theme::Light)).clone();
+        ctx.set_fonts(fonts);
+        let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
         style.spacing.item_spacing = Vec2::new(5.0, 3.0);
         style
             .text_styles
@@ -117,7 +135,10 @@ impl DiskApp {
         style.visuals.panel_fill = Color32::from_rgb(240, 240, 240);
         style.visuals.window_fill = Color32::from_rgb(245, 245, 245);
         style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(240, 240, 240);
-        cc.egui_ctx.set_style_of(egui::Theme::Light, style);
+        ctx.set_style_of(egui::Theme::Light, style);
+    }
+
+    fn with_root(root: String) -> Self {
         Self {
             root,
             search: search::SearchState::default(),
@@ -245,11 +266,11 @@ impl DiskApp {
         }
     }
 
-    fn selected_path(&self) -> Option<&std::path::Path> {
+    fn selected_path(&self) -> Option<PathBuf> {
         self.result
             .as_ref()
-            .and_then(|r| r.nodes.get(self.selected))
-            .map(|node| node.path.as_path())
+            .filter(|result| self.selected < result.nodes.len())
+            .map(|result| result.nodes.path(self.selected))
     }
 
     fn select_treemap_node(&mut self, index: usize) {
@@ -261,21 +282,19 @@ impl DiskApp {
         }
         self.selected = index;
         self.search.query.clear();
-        let mut ancestor = nodes[index].parent;
+        let mut ancestor = nodes[index].parent();
         while let Some(parent) = ancestor {
             self.tree.expand(parent);
-            ancestor = nodes[parent].parent;
+            ancestor = nodes[parent].parent();
         }
         self.scroll_to_selected = true;
     }
 
     fn open_selected(&mut self) {
         #[cfg(windows)]
-        if let Some(node) = self
-            .result
-            .as_ref()
-            .and_then(|result| result.nodes.get(self.selected))
-            && let Err(error) = actions::open(&node.path, node.is_dir)
+        if let Some(result) = &self.result
+            && let Some(node) = result.nodes.get(self.selected)
+            && let Err(error) = actions::open(&result.nodes.path(self.selected), node.is_dir)
         {
             self.status = error;
         }
@@ -306,6 +325,12 @@ impl DiskApp {
 
 impl eframe::App for DiskApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+}
+
+impl DiskApp {
+    fn show(&mut self, ui: &mut egui::Ui) {
         self.poll_scan();
         self.poll_delete();
         if self.search.update(
@@ -586,6 +611,9 @@ impl eframe::App for DiskApp {
                                         self.selected == index,
                                         self.tree.is_expanded(index),
                                     );
+                                    row_response.clone().on_hover_ui(|ui| {
+                                        ui.label(result.nodes.path(index).display().to_string());
+                                    });
                                     if scroll_row
                                         .is_some_and(|selected_row| rows[selected_row].0 == index)
                                     {
@@ -649,7 +677,7 @@ impl eframe::App for DiskApp {
                             };
                             response.clone().on_hover_text(format!(
                                 "{}\n{}",
-                                node.path.display(),
+                                nodes.path(hit as usize).display(),
                                 human_size(node.size)
                             ));
                             if response.clicked() {
@@ -889,13 +917,11 @@ fn draw_directory_row(
     painter.with_clip_rect(name_clip).text(
         egui::pos2(name_clip.left(), row.center().y),
         Align2::LEFT_CENTER,
-        &node.name,
+        node.name.to_string_lossy(),
         FontId::proportional(14.0),
         Color32::from_gray(32),
     );
-    response
-        .clone()
-        .on_hover_text(node.path.display().to_string());
+
     x += TREE_COLUMN_WIDTHS[0];
 
     let percent = if total_size == 0 {
@@ -1087,5 +1113,66 @@ fn human_size(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn selecting_a_distant_tile_reveals_its_row_and_survives_repeated_frames() {
+        let root = PathBuf::from("root");
+        let mut builder = model::TreeBuilder::new(root.clone());
+        for index in 0..10_000 {
+            builder.add(
+                root.join(format!("folder/file-{index:05}.bin")),
+                false,
+                index + 10,
+                None,
+                0,
+            );
+        }
+        builder.add(root.join("folder/target-file.bin"), false, 1, None, 0);
+        let nodes = Arc::new(builder.finish());
+        let target = nodes
+            .iter()
+            .position(|node| node.name.as_ref() == std::ffi::OsStr::new("target-file.bin"))
+            .unwrap();
+        let mut app = DiskApp::with_root("root".into());
+        app.result = Some(ScanResult {
+            nodes,
+            mode: scanner::ScanMode::DirectoryWalk,
+            files: 10_001,
+            elapsed: Duration::ZERO,
+            warnings: scanner::ScanWarnings::default(),
+            timings: scanner::ScanTimings::default(),
+        });
+        app.scan_revision = 1;
+        app.select_treemap_node(target);
+        let ctx = egui::Context::default();
+        DiskApp::configure(&ctx);
+        let mut visible = false;
+        for frame in 0..100 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1360.0, 850.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                ..egui::RawInput::default()
+            };
+            let output = ctx.run_ui(input, |ui| app.show(ui));
+            visible |= output.shapes.iter().any(|shape| match &shape.shape {
+                egui::Shape::Text(text) => text.galley.job.text.contains("target-file.bin"),
+                _ => false,
+            });
+            assert_eq!(app.selected, target);
+        }
+        assert!(
+            visible,
+            "the selected file must actually be painted, not just selected in the model"
+        );
+        assert!(!app.scroll_to_selected);
     }
 }

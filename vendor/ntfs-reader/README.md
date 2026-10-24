@@ -1,0 +1,191 @@
+# ntfs-reader
+
+[![crates.io](https://img.shields.io/crates/v/ntfs-reader)](https://crates.io/crates/ntfs-reader)
+[![docs.rs](https://img.shields.io/docsrs/ntfs-reader)](https://docs.rs/ntfs-reader)
+![license: MIT OR Apache-2.0](https://img.shields.io/crates/l/ntfs-reader)
+
+Reads an NTFS volume's `$MFT` into memory, and its USN change journal. Windows only; reading the raw
+volume, it sees files Windows keeps locked or has deleted.
+
+## Features
+
+- Fast in-memory scan of every record in the $MFT
+- `MftScan`: the same scan without holding the whole $MFT in memory (tens of MiB instead of a
+  gigabyte on a million-file volume)
+- `Mft::new_compact`: a whole `Mft`, kept as usual, at 30 to 70 percent less memory
+- Deleted files: names, sizes, times, paths and, best effort, content
+- Read any file's data from the raw volume, even one Windows keeps locked
+- Cluster bitmap: see whether a deleted file's clusters were reused
+- Usn journal reader
+
+## Examples
+
+Complete programs in `examples`, run from an elevated shell with `cargo run --example <name>`.
+
+| Example           | What it shows                                                                                  | Start here to                          |
+| ----------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `read_mft`        | Every file with its path and size; `--compact` for `Mft::new_compact`, `--scan` for `MftScan`. | list a volume, low on memory too       |
+| `list_hardlinks`  | Files with more than one hard link, and all their paths.                                       | work with hard links                   |
+| `list_deleted`    | A volume's deleted files: size, time, path, and with `--allocation` the data's state.           | see what was deleted                   |
+| `recover_file`    | Copies a deleted file's data to a new file, reporting how much can be trusted.                 | recover a file                         |
+| `monitor_journal` | Watches the journal: created, deleted, renamed, moved and modified files, `--from-start`, `--snapshot`. | monitor a volume                       |
+| `watch_deletes`   | The light version: only deletes, no `Mft`, best effort paths.                                  | log deletes with a few lines           |
+
+## Guides
+
+[Deleted files](docs/deleted-files.md), [the USN journal](docs/journal.md),
+[paths and caches](docs/paths-and-caches.md), [reading file data](docs/reading-data.md) and
+[Volume Shadow Copies](docs/shadow-copies.md), also on docs.rs in the `ntfs_reader::guide`
+modules.
+
+## Opening a volume
+
+`Volume::new` takes a Win32 device path such as `\\.\C:` or `\\?\C:`: the volume itself, not a
+file on it. The crate passes the string straight to `CreateFileW`, so `\\.\` and `\\?\` are
+interchangeable here; the examples below use both only to show that.
+
+Opening a raw volume needs an elevated (administrator) process; without one you get
+`NtfsReaderError::AccessDenied`. Use the device path exactly as shown: a trailing backslash
+(`\\.\C:\`) or a plain `C:` fails with "Access is denied", which looks like a missing elevation
+but is not.
+
+`Volume::new` also accepts an ordinary file containing a flat NTFS volume image, with its boot
+sector at byte zero. It does not locate partitions or interpret VHD/VHDX container metadata.
+MFT and stream reads then use the image, and resolved paths start with the image's path.
+The USN journal still requires a live volume.
+
+The boot sector's file-system size must fit within the opened device's length, or the logical
+file length for an ordinary image. An oversized claim returns `NtfsReaderError::InvalidBootSector`;
+if no length can be obtained, construction fails with an I/O error. The reported volume size
+remains the file-system size, excluding unused space after it.
+
+## Listing files
+
+```rust,no_run
+# use ntfs_reader::{DefaultPathCache, FileInfo, Mft, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mft = Mft::new(Volume::new(r"\\.\C:")?)?;
+let mut cache = DefaultPathCache::new(); // remembers directory paths, faster on a scan
+
+// Every in-use file, except the 24 records NTFS reserves (so not the root directory).
+for file in mft.files() {
+    let info = FileInfo::with_cache(&file, &mut cache);
+    println!("{:?} {} bytes", info.path, info.size); // `path` is None if it cannot be resolved
+}
+# Ok(())
+# }
+```
+
+More: [paths and caches](docs/paths-and-caches.md), docs.rs `ntfs_reader::guide::paths_and_caches`.
+
+## Scanning a large volume without holding it all
+
+`Mft::new` reads the whole `$MFT` into memory: about 1 KiB per file. `MftScan` visits every file,
+live and deleted, reading `$MFT` twice in chunks instead of holding it, at a few MiB even on a
+million-file volume:
+
+```rust,no_run
+# use ntfs_reader::{DefaultPathCache, FileInfo, MftScan, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut scan = MftScan::new(Volume::new(r"\\.\C:")?)?;
+let mut cache = DefaultPathCache::new();
+while let Some(chunk) = scan.next_chunk()? {
+    for file in chunk.files() {
+        let info = FileInfo::with_cache(&file, &mut cache);
+    }
+}
+# Ok(())
+# }
+```
+
+More, including what two reads of a live volume can disagree on: [paths and
+caches](docs/paths-and-caches.md#scanning-a-large-volume).
+
+Paths use the directory index from the first read, including missing directories, so cache
+eviction does not change a path. `MftChunk::record` returns an extension record only while its
+base record is available; `files()` and `deleted_files()` include their files' retained extensions.
+
+For random access with less memory, `Mft::new_compact(volume)` retains each record's used bytes
+and the header and update sequence array needed to validate it. It sizes the store in a first
+pass and grows it fallibly if a live volume changes before the second pass.
+
+## Reading a stream
+
+```rust,no_run
+# use std::io::Read;
+# use ntfs_reader::{Mft, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mft = Mft::new(Volume::new(r"\\.\C:")?)?;
+for file in mft.files().filter(|file| !file.is_directory()).take(10) {
+    let Ok(mut stream) = file.open_stream(None) else { continue };
+    let mut head = Vec::new();
+    stream.by_ref().take(16).read_to_end(&mut head)?;
+    println!("{} bytes, starts with {:02x?}", stream.size(), head);
+}
+# Ok(())
+# }
+```
+
+The reader is `Read + Seek` and works on a locked file; `Some(name)` opens an alternate stream.
+Compressed and encrypted streams error out. More: [reading data](docs/reading-data.md), docs.rs `ntfs_reader::guide::reading_data`.
+
+## Deleted files
+
+```rust,no_run
+# use ntfs_reader::{DeletedPathCache, Mft, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mft = Mft::new(Volume::new(r"\\.\C:")?)?;
+let mut cache = DeletedPathCache::new();
+for file in mft.deleted_files().filter(|file| !file.is_directory()) {
+    let Some(name) = file.best_name() else { continue };
+    let found = mft.resolve_deleted_path(&name, &mut cache);
+    // An incomplete path has a marker (`found.marker`) where a directory is unknown, shown as
+    // `\\.\C:\<lost 1234>\dir\file.txt`; `found.path` alone holds only the real names.
+    println!("{}", found.to_marked_path(mft.volume().path()).display());
+}
+# Ok(())
+# }
+```
+
+Deleted data is best effort: NTFS reuses a freed record for a new file (the very next one, on a quiet
+volume), and a free cluster may already be trimmed (zeroes, or noise on BitLocker). More: [deleted files](docs/deleted-files.md), docs.rs `ntfs_reader::guide::deleted_files`.
+
+## Watching the journal
+
+The journal must be active (`fsutil usn createjournal m=<size> a=<delta> <drive>:` creates one).
+
+```rust,no_run
+# use std::time::Duration;
+# use ntfs_reader::{Journal, JournalOptions, Reason, Volume};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut journal = Journal::new(Volume::new(r"\\.\C:")?, JournalOptions::default())?; // new events only
+loop {
+    let page = journal.read()?;
+    // NTFS puts every bit of one open handle in the record of its close: act on those.
+    for record in page.records.iter().filter(|r| r.reason.contains(Reason::CLOSE)) {
+        let reason = record.reason;
+        if reason.contains(Reason::FILE_DELETE) {
+            // None when the parent is gone too. A file deleted while open (or a directory removed
+            // with `remove_dir_all`) resolves to `\\.\C:\$Extend\$Deleted\<random>`: it was renamed
+            // there before the delete, and its real name is lost.
+            println!("deleted {:?}", journal.resolve_path(record));
+        } else if reason.contains(Reason::RENAME_NEW_NAME) {
+            println!("renamed {:?} to {:?}", journal.match_rename(record), journal.resolve_path(record));
+        } else if reason.contains(Reason::FILE_CREATE) {
+            println!("created {:?}", journal.resolve_path(record));
+        }
+    }
+    if page.caught_up {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+# }
+```
+
+Test `FILE_DELETE` first: a temporary file created and deleted through one handle is one record with
+both bits. Modified files, attributes and hard links have their own reasons. More: [the journal](docs/journal.md), docs.rs `ntfs_reader::guide::journal`.
+
+## Development
+
+Building, testing and the development shell are described in
+[CONTRIBUTING.md](CONTRIBUTING.md).

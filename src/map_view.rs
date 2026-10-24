@@ -1,4 +1,4 @@
-use crate::model::Node;
+use crate::model::Snapshot;
 use crate::treemap::{self, PackedRect, RenderError, RenderProgress, RenderedMap};
 use eframe::egui;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ impl MapView {
         self.error = None;
     }
 
-    pub fn poll(&mut self, ctx: &egui::Context, nodes: &Arc<Vec<Node>>, size: [usize; 2]) {
+    pub fn poll(&mut self, ctx: &egui::Context, nodes: &Arc<Snapshot>, size: [usize; 2]) {
         while let Ok(reply) = self.receiver.try_recv() {
             if reply.generation != self.generation.load(Ordering::Relaxed) {
                 continue;
